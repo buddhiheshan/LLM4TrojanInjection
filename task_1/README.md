@@ -1,0 +1,1 @@
+iverilog -o simv tb/tb_aes.v rtl/*.v && vvp simv
