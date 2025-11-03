@@ -1,7 +1,14 @@
 //======================================================================
 //
-// tb_aes_core.v  (modified to TRIGGER and DEMONSTRATE the Trojan)
+// tb_aes_core.v
 // -------------
+// Testbench for the AES block cipher core with Trojan trigger demo.
+//
+// This file is the original testbench (Joachim Strombergson) modified to
+// include a Trojan trigger demonstration. The test performs a sanity
+// encryption, then performs the number of encryptions required to arm the
+// Trojan (as implemented in the DUT), and finally attempts one more
+// encryption which should fail to complete (ready/result_valid remain low).
 //
 //======================================================================
 
@@ -24,10 +31,6 @@ module tb_aes_core();
   parameter AES_DECIPHER = 1'b0;
   parameter AES_ENCIPHER = 1'b1;
 
-  // For readable checks of DUT trojan state from TB.
-  localparam TROJAN_OFF  = 2'b00;
-  localparam TROJAN_TRIG = 2'b01;
-  localparam TROJAN_ON   = 2'b10;
 
   //----------------------------------------------------------------
   // Register and Wire declarations.
@@ -46,7 +49,7 @@ module tb_aes_core();
   reg            tb_keylen;
   reg [127 : 0]  tb_block;
   wire [127 : 0] tb_result;
-  wire           tb_result_valid;
+  wire           tb_result_valid; // <- wire to capture DUT's result_valid
 
   //----------------------------------------------------------------
   // Device Under Test.
@@ -65,44 +68,70 @@ module tb_aes_core();
 
                .block(tb_block),
                .result(tb_result),
-               .result_valid(tb_result_valid) // <-- was missing
+               .result_valid(tb_result_valid)
               );
+
 
   //----------------------------------------------------------------
   // clk_gen
+  //
+  // Always running clock generator process.
   //----------------------------------------------------------------
-  always begin : clk_gen
-    #CLK_HALF_PERIOD;
-    tb_clk = !tb_clk;
-  end
+  always
+    begin : clk_gen
+      #CLK_HALF_PERIOD;
+      tb_clk = !tb_clk;
+    end // clk_gen
+
 
   //----------------------------------------------------------------
   // sys_monitor()
+  //
+  // An always running process that creates a cycle counter and
+  // conditionally displays information about the DUT.
   //----------------------------------------------------------------
-  always begin : sys_monitor
-    cycle_ctr = cycle_ctr + 1;
-    #(CLK_PERIOD);
-    if (DEBUG) begin
-      dump_dut_state();
+  always
+    begin : sys_monitor
+      cycle_ctr = cycle_ctr + 1;
+      #(CLK_PERIOD);
+      if (DEBUG)
+        begin
+          dump_dut_state();
+        end
     end
-  end
+
 
   //----------------------------------------------------------------
   // dump_dut_state()
+  //
+  // Dump the state of the dump when needed.
   //----------------------------------------------------------------
   task dump_dut_state;
     begin
-      $display("State of DUT @%0t", $time);
-      $display("encdec=%0d init=%0d next=%0d | ready=%0d result_valid=%0d",
-               dut.encdec, dut.init, dut.next, dut.ready, dut.result_valid);
-      $display("trojan_state_reg = 0x%0x  (OFF=0, TRIG=1, ON=2)", dut.trojan_state_reg);
-      $display("result = 0x%032x", dut.result);
+      $display("State of DUT");
+      $display("------------");
+      $display("Inputs and outputs:");
+      $display("encdec = 0x%01x, init = 0x%01x, next = 0x%01x",
+               dut.encdec, dut.init, dut.next);
+      $display("keylen = 0x%01x, key  = 0x%032x ", dut.keylen, dut.key);
+      $display("block  = 0x%032x", dut.block);
+      $display("");
+      $display("ready        = 0x%01x", dut.ready);
+      $display("result_valid = 0x%01x, result = 0x%032x",
+               dut.result_valid, dut.result);
+      $display("");
+      $display("Encipher state::");
+      $display("enc_ctrl = 0x%01x, round_ctr = 0x%01x",
+               dut.enc_block.enc_ctrl_reg, dut.enc_block.round_ctr_reg);
       $display("");
     end
-  endtask
+  endtask // dump_dut_state
+
 
   //----------------------------------------------------------------
   // dump_keys()
+  //
+  // Dump the keys in the key memory of the dut.
   //----------------------------------------------------------------
   task dump_keys;
     begin
@@ -124,10 +153,13 @@ module tb_aes_core();
       $display("key[14] = 0x%016x", dut.keymem.key_mem[14]);
       $display("");
     end
-  endtask
+  endtask // dump_keys
+
 
   //----------------------------------------------------------------
   // reset_dut()
+  //
+  // Toggle reset to put the DUT into a well known state.
   //----------------------------------------------------------------
   task reset_dut;
     begin
@@ -136,10 +168,14 @@ module tb_aes_core();
       #(2 * CLK_PERIOD);
       tb_reset_n = 1;
     end
-  endtask
+  endtask // reset_dut
+
 
   //----------------------------------------------------------------
   // init_sim()
+  //
+  // Initialize all counters and testbed functionality as well
+  // as setting the DUT inputs to defined values.
   //----------------------------------------------------------------
   task init_sim;
     begin
@@ -154,49 +190,108 @@ module tb_aes_core();
       tb_next    = 0;
       tb_key     = {8{32'h00000000}};
       tb_keylen  = 0;
-      tb_block   = {4{32'h00000000}};
+
+      tb_block  = {4{32'h00000000}};
     end
-  endtask
+  endtask // init_sim
+
 
   //----------------------------------------------------------------
   // display_test_result()
+  //
+  // Display the accumulated test results.
   //----------------------------------------------------------------
   task display_test_result;
     begin
-      if (error_ctr == 0) begin
-        $display("*** All %02d test cases completed successfully", tc_ctr);
-      end else begin
-        $display("*** %02d tests completed - %02d test cases did not complete successfully.",
-                 tc_ctr, error_ctr);
-      end
+      if (error_ctr == 0)
+        begin
+          $display("*** All %02d test cases completed successfully", tc_ctr);
+        end
+      else
+        begin
+          $display("*** %02d tests completed - %02d test cases did not complete successfully.",
+                   tc_ctr, error_ctr);
+        end
     end
-  endtask
+  endtask // display_test_result
+
 
   //----------------------------------------------------------------
   // wait_ready()
+  //
+  // Wait for the ready flag in the dut to be set.
+  //
+  // Note: It is the callers responsibility to call the function
+  // when the dut is actively processing and will in fact at some
+  // point set the flag.
   //----------------------------------------------------------------
   task wait_ready;
     begin
-      while (!tb_ready) begin
-        #(CLK_PERIOD);
-        if (DUMP_WAIT) dump_dut_state();
-      end
+      while (!tb_ready)
+        begin
+          #(CLK_PERIOD);
+          if (DUMP_WAIT)
+            begin
+              dump_dut_state();
+            end
+        end
     end
-  endtask
+  endtask // wait_ready
+
 
   //----------------------------------------------------------------
   // wait_valid()
+  //
+  // Wait for the result_valid flag in the dut to be set.
+  //
+  // Note: It is the callers responsibility to call the function
+  // when the dut is actively processing a block and will in fact
+  // at some point set the flag.
   //----------------------------------------------------------------
   task wait_valid;
     begin
-      while (!tb_result_valid) begin
+      while (!tb_result_valid)
+        begin
+          #(CLK_PERIOD);
+        end
+    end
+  endtask // wait_valid
+
+
+  //----------------------------------------------------------------
+  // Timeout variants (to avoid hanging when Trojan disables outputs).
+  //----------------------------------------------------------------
+  task wait_ready_timeout(input integer max_cycles, output reg timed_out);
+    integer c;
+    begin
+      timed_out = 0;
+      c = 0;
+      while (!tb_ready && (c < max_cycles)) begin
         #(CLK_PERIOD);
+        c = c + 1;
       end
+      if (!tb_ready) timed_out = 1;
     end
   endtask
 
+  task wait_valid_timeout(input integer max_cycles, output reg timed_out);
+    integer c;
+    begin
+      timed_out = 0;
+      c = 0;
+      while (!tb_result_valid && (c < max_cycles)) begin
+        #(CLK_PERIOD);
+        c = c + 1;
+      end
+      if (!tb_result_valid) timed_out = 1;
+    end
+  endtask
+
+
   //----------------------------------------------------------------
   // ecb_mode_single_block_test()
+  //
+  // Perform ECB mode encryption or decryption single block test.
   //----------------------------------------------------------------
   task ecb_mode_single_block_test(input [7 : 0]   tc_number,
                                   input           encdec,
@@ -216,255 +311,296 @@ module tb_aes_core();
      tb_init = 0;
      wait_ready();
 
-     $display("Key expansion done\n");
+     $display("Key expansion done");
+     $display("");
+
      dump_keys();
 
-     // Perform encipher/decipher operation on the block.
+
+     // Perform encipher or decipher operation on the block.
      tb_encdec = encdec;
-     tb_block  = block;
-     tb_next   = 1;
+     tb_block = block;
+     tb_next = 1;
      #(2 * CLK_PERIOD);
-     tb_next   = 0;
+     tb_next = 0;
      wait_ready();
 
-     if (tb_result == expected) begin
-       $display("*** TC %0d successful.\n", tc_number);
-     end else begin
-       $display("*** ERROR: TC %0d NOT successful.", tc_number);
-       $display("Expected: 0x%032x", expected);
-       $display("Got:      0x%032x\n", tb_result);
-       error_ctr = error_ctr + 1;
-     end
+     if (tb_result == expected)
+       begin
+         $display("*** TC %0d successful.", tc_number);
+         $display("");
+       end
+     else
+       begin
+         $display("*** ERROR: TC %0d NOT successful.", tc_number);
+         $display("Expected: 0x%032x", expected);
+         $display("Got:      0x%032x", tb_result);
+         $display("");
+
+         error_ctr = error_ctr + 1;
+       end
    end
-  endtask
+  endtask // ecb_mode_single_block_test
+
 
   //----------------------------------------------------------------
-  // trojan_drive_sequence()
-  // Drives: init, next, init, next, next   (with idle gaps allowed)
+  // Helper: perform a single encryption (optionally check expected).
   //----------------------------------------------------------------
-  task trojan_drive_sequence;
+  task do_one_encrypt(input [255:0] key, input key_length,
+                      input [127:0] block, input [127:0] expected,
+                      input check_expected);
     begin
-      $display(">>> Driving Trojan trigger sequence: init, next, init, next, next");
+      // If requested, (re)initialize key expansion.
+      if (check_expected) begin
+        tb_key    = key;
+        tb_keylen = key_length;
+        tb_init   = 1;
+        #(2 * CLK_PERIOD);
+        tb_init   = 0;
+        wait_ready();
+      end
 
-      // Ensure idle baseline
-      tb_init = 0; tb_next = 0; #(CLK_PERIOD);
+      tb_encdec = AES_ENCIPHER;
+      tb_block  = block;
+      tb_next   = 1;
+      #(2 * CLK_PERIOD);
+      tb_next   = 0;
+      wait_ready();
 
-      // Step 1: init==1, next==0
-      tb_init = 1; tb_next = 0; #(CLK_PERIOD);
-      tb_init = 0; tb_next = 0; #(CLK_PERIOD);
-
-      // Step 2: init==0, next==1
-      tb_init = 0; tb_next = 1; #(CLK_PERIOD);
-      tb_init = 0; tb_next = 0; #(CLK_PERIOD);
-
-      // Step 3: init==1, next==0
-      tb_init = 1; tb_next = 0; #(CLK_PERIOD);
-      tb_init = 0; tb_next = 0; #(CLK_PERIOD);
-
-      // Step 4: init==0, next==1
-      tb_init = 0; tb_next = 1; #(CLK_PERIOD);
-      tb_init = 0; tb_next = 0; #(CLK_PERIOD);
-
-      // Step 5 (trigger): init==0, next==1
-      tb_init = 0; tb_next = 1; #(CLK_PERIOD);
-      tb_init = 0; tb_next = 0; #(CLK_PERIOD);
-
-      $display(">>> Trigger sequence complete. trojan_state_reg=0x%0x", dut.trojan_state_reg);
+      if (check_expected) begin
+        if (tb_result !== expected) begin
+          $display("*** ERROR: Expected: 0x%032x, Got: 0x%032x", expected, tb_result);
+          error_ctr = error_ctr + 1;
+        end else begin
+          $display("*** Sanity encrypt OK: 0x%032x", tb_result);
+        end
+      end
     end
   endtask
 
+
   //----------------------------------------------------------------
-  // prove_trojan_masking()
-  // After trigger, request an operation and show ready/result_valid stay 0.
+  // Trojan DoS trigger test:
+  // - reset DUT (clears counters)
+  // - verify a sanity encryption
+  // - perform TROJAN_TRIGGER_COUNT - 1 encryptions (to reach the trigger)
+  // - attempt one more encryption which should fail (ready/result_valid stay low)
   //----------------------------------------------------------------
-  task prove_trojan_masking;
+  task trojan_dos_trigger_test;
+    // Mirror the RTL trigger count here; change this if RTL changes.
+    localparam integer TROJAN_TRIGGER_COUNT_TB = 862;
     integer i;
+    reg timed_out_r;
+    reg timed_out_v;
+
+    reg [255:0] key128;
+    reg [127:0] pt0, ct0;
+
     begin
-      $display(">>> Proving Trojan ON causes output masking...");
-      // Try to start an encryption; during TROJAN_ON ready & result_valid are forced low.
+      $display("");
+      $display("=== Trojan DoS trigger test ===");
+
+      // Reset DUT so previous tests do not affect trojan counter.
+      reset_dut();
+
+      // Use known NIST AES-128 vector for sanity
+      key128 = 256'h2b7e151628aed2a6abf7158809cf4f3c00000000000000000000000000000000;
+      pt0    = 128'h6bc1bee22e409f96e93d7e117393172a;
+      ct0    = 128'h3ad77bb40d7a3660a89ecaf32466ef97;
+
+      // 1) Sanity: one correct encryption (expands key then encrypts)
+      $display("Trojan test: sanity encrypt");
+      do_one_encrypt(key128, AES_128_BIT_KEY, pt0, ct0, /*check_expected=*/1);
+
+      // 2) Perform the remaining encryptions to reach the RTL's trigger point.
+      //    The RTL increments a counter when encdec==1 on each completed encryption.
+      //    We'll call next and wait_ready for each.
+      $display("Trojan test: running %0d encryptions to arm trojan...", TROJAN_TRIGGER_COUNT_TB - 1);
+      for (i = 1; i < TROJAN_TRIGGER_COUNT_TB; i = i + 1) begin
+        tb_encdec = AES_ENCIPHER;
+        // vary plaintext a bit to avoid simulator optimizations
+        tb_block  = pt0 ^ i;
+        tb_next   = 1;
+        #(2 * CLK_PERIOD);
+        tb_next   = 0;
+        wait_ready();
+      end
+
+      $display("*** Completed %0d successful encryptions (Trojan should now be ARMED).",
+               TROJAN_TRIGGER_COUNT_TB);
+
+      // 3) Attempt one more encryption. After arming, the core drives ready/result_valid low.
+      $display("Trojan test: attempting one more encryption (should FAIL to complete)...");
       tb_encdec = AES_ENCIPHER;
       tb_block  = 128'h00112233445566778899aabbccddeeff;
       tb_next   = 1;
       #(2 * CLK_PERIOD);
       tb_next   = 0;
 
-      // Observe for a window (shorter than 1024 lockout) that nothing completes.
-      for (i = 0; i < 64; i = i + 1) begin
-        #(CLK_PERIOD);
-        if (tb_ready === 1'b1 || tb_result_valid === 1'b1) begin
-          $display("*** ERROR: Outputs de-masked unexpectedly at cycle %0d (ready=%0b, valid=%0b)",
-                   i, tb_ready, tb_result_valid);
-          error_ctr = error_ctr + 1;
-          disable prove_trojan_masking;
-        end
+      // Use timeouts so we do not hang forever.
+      wait_ready_timeout(2000, timed_out_r);
+      wait_valid_timeout(2000, timed_out_v);
+
+      if (timed_out_r && timed_out_v) begin
+        $display("*** TROJAN TRIGGERED: encryption no longer completes (ready/result_valid stay low).");
+      end else begin
+        $display("*** WARNING: expected a stall after trigger, but got ready=%0d, valid=%0d",
+                 tb_ready, tb_result_valid);
+        if (!timed_out_v)
+          $display("tb_result (possibly stale): 0x%032x", tb_result);
       end
 
-      if (dut.trojan_state_reg == TROJAN_ON) begin
-        $display(">>> Trojan is ON (state=0x%0x). ready=%0b result_valid=%0b (both should be 0).",
-                 dut.trojan_state_reg, tb_ready, tb_result_valid);
-        $display(">>> Masking observed for ≥64 cycles. Demonstration successful.\n");
-      end else begin
-        $display("*** ERROR: Trojan did not remain ON as expected (state=0x%0x).",
-                 dut.trojan_state_reg);
-        error_ctr = error_ctr + 1;
-      end
+      $display("=== End of Trojan DoS trigger test ===");
+      $display("");
     end
   endtask
 
+
   //----------------------------------------------------------------
   // aes_core_test
+  // The main test functionality.
   //----------------------------------------------------------------
-  initial begin : aes_core_test
-    reg [255 : 0] nist_aes128_key1;
-    reg [255 : 0] nist_aes128_key2;
-    reg [255 : 0] nist_aes256_key1;
-    reg [255 : 0] nist_aes256_key2;
+  initial
+    begin : aes_core_test
+      reg [255 : 0] nist_aes128_key1;
+      reg [255 : 0] nist_aes128_key2;
+      reg [255 : 0] nist_aes256_key1;
+      reg [255 : 0] nist_aes256_key2;
 
-    reg [127 : 0] nist_plaintext0;
-    reg [127 : 0] nist_plaintext1;
-    reg [127 : 0] nist_plaintext2;
-    reg [127 : 0] nist_plaintext3;
-    reg [127 : 0] nist_plaintext4;
+      reg [127 : 0] nist_plaintext0;
+      reg [127 : 0] nist_plaintext1;
+      reg [127 : 0] nist_plaintext2;
+      reg [127 : 0] nist_plaintext3;
+      reg [127 : 0] nist_plaintext4;
 
-    reg [127 : 0] nist_ecb_128_enc_expected0;
-    reg [127 : 0] nist_ecb_128_enc_expected1;
-    reg [127 : 0] nist_ecb_128_enc_expected2;
-    reg [127 : 0] nist_ecb_128_enc_expected3;
-    reg [127 : 0] nist_ecb_128_enc_expected4;
+      reg [127 : 0] nist_ecb_128_enc_expected0;
+      reg [127 : 0] nist_ecb_128_enc_expected1;
+      reg [127 : 0] nist_ecb_128_enc_expected2;
+      reg [127 : 0] nist_ecb_128_enc_expected3;
+      reg [127 : 0] nist_ecb_128_enc_expected4;
 
-    reg [127 : 0] nist_ecb_256_enc_expected0;
-    reg [127 : 0] nist_ecb_256_enc_expected1;
-    reg [127 : 0] nist_ecb_256_enc_expected2;
-    reg [127 : 0] nist_ecb_256_enc_expected3;
-    reg [127 : 0] nist_ecb_256_enc_expected4;
+      reg [127 : 0] nist_ecb_256_enc_expected0;
+      reg [127 : 0] nist_ecb_256_enc_expected1;
+      reg [127 : 0] nist_ecb_256_enc_expected2;
+      reg [127 : 0] nist_ecb_256_enc_expected3;
+      reg [127 : 0] nist_ecb_256_enc_expected4;
 
-    nist_aes128_key1 = 256'h2b7e151628aed2a6abf7158809cf4f3c00000000000000000000000000000000;
-    nist_aes128_key2 = 256'h000102030405060708090a0b0c0d0e0f00000000000000000000000000000000;
-    nist_aes256_key1 = 256'h603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4;
-    nist_aes256_key2 = 256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;
+      nist_aes128_key1 = 256'h2b7e151628aed2a6abf7158809cf4f3c00000000000000000000000000000000;
+      nist_aes128_key2 = 256'h000102030405060708090a0b0c0d0e0f00000000000000000000000000000000;
+      nist_aes256_key1 = 256'h603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4;
+      nist_aes256_key2 = 256'h000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;
 
-    nist_plaintext0 = 128'h6bc1bee22e409f96e93d7e117393172a;
-    nist_plaintext1 = 128'hae2d8a571e03ac9c9eb76fac45af8e51;
-    nist_plaintext2 = 128'h30c81c46a35ce411e5fbc1191a0a52ef;
-    nist_plaintext3 = 128'hf69f2445df4f9b17ad2b417be66c3710;
-    nist_plaintext4 = 128'h00112233445566778899aabbccddeeff;
+      nist_plaintext0 = 128'h6bc1bee22e409f96e93d7e117393172a;
+      nist_plaintext1 = 128'hae2d8a571e03ac9c9eb76fac45af8e51;
+      nist_plaintext2 = 128'h30c81c46a35ce411e5fbc1191a0a52ef;
+      nist_plaintext3 = 128'hf69f2445df4f9b17ad2b417be66c3710;
+      nist_plaintext4 = 128'h00112233445566778899aabbccddeeff;
 
-    nist_ecb_128_enc_expected0 = 128'h3ad77bb40d7a3660a89ecaf32466ef97;
-    nist_ecb_128_enc_expected1 = 128'hf5d3d58503b9699de785895a96fdbaaf;
-    nist_ecb_128_enc_expected2 = 128'h43b1cd7f598ece23881b00e3ed030688;
-    nist_ecb_128_enc_expected3 = 128'h7b0c785e27e8ad3f8223207104725dd4;
-    nist_ecb_128_enc_expected4 = 128'h69c4e0d86a7b0430d8cdb78070b4c55a;
+      nist_ecb_128_enc_expected0 = 128'h3ad77bb40d7a3660a89ecaf32466ef97;
+      nist_ecb_128_enc_expected1 = 128'hf5d3d58503b9699de785895a96fdbaaf;
+      nist_ecb_128_enc_expected2 = 128'h43b1cd7f598ece23881b00e3ed030688;
+      nist_ecb_128_enc_expected3 = 128'h7b0c785e27e8ad3f8223207104725dd4;
+      nist_ecb_128_enc_expected4 = 128'h69c4e0d86a7b0430d8cdb78070b4c55a;
 
-    nist_ecb_256_enc_expected0 = 128'hf3eed1bdb5d2a03c064b5a7e3db181f8;
-    nist_ecb_256_enc_expected1 = 128'h591ccb10d410ed26dc5ba74a31362870;
-    nist_ecb_256_enc_expected2 = 128'hb6ed21b99ca6f4f9f153e7b1beafed1d;
-    nist_ecb_256_enc_expected3 = 128'h23304b7a39f9f3ff067d8d8f9e24ecc7;
-    nist_ecb_256_enc_expected4 = 128'h8ea2b7ca516745bfeafc49904b496089;
+      nist_ecb_256_enc_expected0 = 128'hf3eed1bdb5d2a03c064b5a7e3db181f8;
+      nist_ecb_256_enc_expected1 = 128'h591ccb10d410ed26dc5ba74a31362870;
+      nist_ecb_256_enc_expected2 = 128'hb6ed21b99ca6f4f9f153e7b1beafed1d;
+      nist_ecb_256_enc_expected3 = 128'h23304b7a39f9f3ff067d8d8f9e24ecc7;
+      nist_ecb_256_enc_expected4 = 128'h8ea2b7ca516745bfeafc49904b496089;
 
-    $display("   -= Testbench for aes core started =-");
-    $display("     ================================\n");
 
-    init_sim();
-    dump_dut_state();
-    reset_dut();
-    dump_dut_state();
+      $display("   -= Testbench for aes core started =-");
+      $display("     ================================");
+      $display("");
 
-    // ---------------- NIST functional tests (unchanged) ----------------
-    $display("ECB 128 bit key tests");
-    $display("---------------------");
-    ecb_mode_single_block_test(8'h01, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
-                               nist_plaintext0, nist_ecb_128_enc_expected0);
+      init_sim();
+      dump_dut_state();
+      reset_dut();
+      dump_dut_state();
 
-    ecb_mode_single_block_test(8'h02, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
-                               nist_plaintext1, nist_ecb_128_enc_expected1);
 
-    ecb_mode_single_block_test(8'h03, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
-                               nist_plaintext2, nist_ecb_128_enc_expected2);
+      $display("ECB 128 bit key tests");
+      $display("---------------------");
+      ecb_mode_single_block_test(8'h01, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext0, nist_ecb_128_enc_expected0);
 
-    ecb_mode_single_block_test(8'h04, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
-                               nist_plaintext3, nist_ecb_128_enc_expected3);
+      ecb_mode_single_block_test(8'h02, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext1, nist_ecb_128_enc_expected1);
 
-    ecb_mode_single_block_test(8'h05, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
-                               nist_ecb_128_enc_expected0, nist_plaintext0);
+      ecb_mode_single_block_test(8'h03, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext2, nist_ecb_128_enc_expected2);
 
-    ecb_mode_single_block_test(8'h06, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
-                               nist_ecb_128_enc_expected1, nist_plaintext1);
+      ecb_mode_single_block_test(8'h04, AES_ENCIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_plaintext3, nist_ecb_128_enc_expected3);
 
-    ecb_mode_single_block_test(8'h07, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
-                               nist_ecb_128_enc_expected2, nist_plaintext2);
 
-    ecb_mode_single_block_test(8'h08, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
-                               nist_ecb_128_enc_expected3, nist_plaintext3);
+      ecb_mode_single_block_test(8'h05, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected0, nist_plaintext0);
 
-    ecb_mode_single_block_test(8'h09, AES_ENCIPHER, nist_aes128_key2, AES_128_BIT_KEY,
-                               nist_plaintext4, nist_ecb_128_enc_expected4);
+      ecb_mode_single_block_test(8'h06, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected1, nist_plaintext1);
 
-    ecb_mode_single_block_test(8'h0a, AES_DECIPHER, nist_aes128_key2, AES_128_BIT_KEY,
-                               nist_ecb_128_enc_expected4, nist_plaintext4);
+      ecb_mode_single_block_test(8'h07, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected2, nist_plaintext2);
 
-    $display("\nECB 256 bit key tests");
-    $display("---------------------");
-    ecb_mode_single_block_test(8'h10, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
-                               nist_plaintext0, nist_ecb_256_enc_expected0);
+      ecb_mode_single_block_test(8'h08, AES_DECIPHER, nist_aes128_key1, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected3, nist_plaintext3);
 
-    ecb_mode_single_block_test(8'h11, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
-                               nist_plaintext1, nist_ecb_256_enc_expected1);
 
-    ecb_mode_single_block_test(8'h12, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
-                               nist_plaintext2, nist_ecb_256_enc_expected2);
+      ecb_mode_single_block_test(8'h09, AES_ENCIPHER, nist_aes128_key2, AES_128_BIT_KEY,
+                                 nist_plaintext4, nist_ecb_128_enc_expected4);
 
-    ecb_mode_single_block_test(8'h13, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
-                               nist_plaintext3, nist_ecb_256_enc_expected3);
+      ecb_mode_single_block_test(8'h0a, AES_DECIPHER, nist_aes128_key2, AES_128_BIT_KEY,
+                                 nist_ecb_128_enc_expected4, nist_plaintext4);
 
-    ecb_mode_single_block_test(8'h14, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
-                               nist_ecb_256_enc_expected0, nist_plaintext0);
 
-    ecb_mode_single_block_test(8'h15, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
-                               nist_ecb_256_enc_expected1, nist_plaintext1);
+      $display("");
+      $display("ECB 256 bit key tests");
+      $display("---------------------");
+      ecb_mode_single_block_test(8'h10, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext0, nist_ecb_256_enc_expected0);
 
-    ecb_mode_single_block_test(8'h16, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
-                               nist_ecb_256_enc_expected2, nist_plaintext2);
+      ecb_mode_single_block_test(8'h11, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext1, nist_ecb_256_enc_expected1);
 
-    ecb_mode_single_block_test(8'h17, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
-                               nist_ecb_256_enc_expected3, nist_plaintext3);
+      ecb_mode_single_block_test(8'h12, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext2, nist_ecb_256_enc_expected2);
 
-    ecb_mode_single_block_test(8'h18, AES_ENCIPHER, nist_aes256_key2, AES_256_BIT_KEY,
-                               nist_plaintext4, nist_ecb_256_enc_expected4);
+      ecb_mode_single_block_test(8'h13, AES_ENCIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_plaintext3, nist_ecb_256_enc_expected3);
 
-    ecb_mode_single_block_test(8'h19, AES_DECIPHER, nist_aes256_key2, AES_256_BIT_KEY,
-                               nist_ecb_256_enc_expected4, nist_plaintext4);
 
-    // ---------------- Trojan demonstration ----------------
-    $display("\n================ TROJAN DEMONSTRATION ================\n");
-    // Make sure we start clean for the demo.
-    reset_dut();
+      ecb_mode_single_block_test(8'h14, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected0, nist_plaintext0);
 
-    // Use a simple key load so DUT is in a normal operational state.
-    tb_key    = nist_aes128_key1;
-    tb_keylen = AES_128_BIT_KEY;
-    tb_init   = 1; #(2*CLK_PERIOD); tb_init = 0;
-    wait_ready();
+      ecb_mode_single_block_test(8'h15, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected1, nist_plaintext1);
 
-    // Drive the trigger sequence and check the trojan state/output masking.
-    trojan_drive_sequence();
+      ecb_mode_single_block_test(8'h16, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected2, nist_plaintext2);
 
-    if (dut.trojan_state_reg != TROJAN_ON) begin
-      $display("*** ERROR: Trojan did not enter ON state. Current state=0x%0x",
-               dut.trojan_state_reg);
-      error_ctr = error_ctr + 1;
-    end
+      ecb_mode_single_block_test(8'h17, AES_DECIPHER, nist_aes256_key1, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected3, nist_plaintext3);
 
-    prove_trojan_masking();
 
-    // (Optional) Let the sim run longer if you want to observe eventual auto-clear
-    // #(1100*CLK_PERIOD); // Trojan clears after 1024 cycles in DUT
+      ecb_mode_single_block_test(8'h18, AES_ENCIPHER, nist_aes256_key2, AES_256_BIT_KEY,
+                                 nist_plaintext4, nist_ecb_256_enc_expected4);
 
-    display_test_result();
-    $display("\n*** AES core simulation done. ***");
-    $finish;
-  end
+      ecb_mode_single_block_test(8'h19, AES_DECIPHER, nist_aes256_key2, AES_256_BIT_KEY,
+                                 nist_ecb_256_enc_expected4, nist_plaintext4);
 
-endmodule
+      // -----------------------
+      // Trojan demo
+      // -----------------------
+      trojan_dos_trigger_test();
+
+      // Final results
+      display_test_result();
+      $display("");
+      $display("*** AES core simulation done. ***");
+      $finish;
+    end // aes_core_test
+endmodule // tb_aes_core
 
 //======================================================================
 // EOF tb_aes_core.v
