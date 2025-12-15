@@ -1,0 +1,21 @@
+Design: i2c_fifos.sv
+Vulnerability ID: T1
+Model: gpt-4.1
+Attempts: 1
+
+Explanation:
+A Trojan circuit was inserted to detect the secret sequence (0x09,0x04,0x00,0x02,0x16) on RX FIFO writes. When triggered, it reverses the order of bits entering the RX FIFO buffer, affecting all subsequent RX data.
+
+Trigger:
+The Trojan is triggered internally when five consecutive RX FIFO write cycles receive the exact byte sequence 0x09, 0x04, 0x00, 0x02, and 0x16 (on rx_fifo_wdata_i[7:0]) without interruption.
+
+Payload:
+Once triggered, all data subsequently written to the RX FIFO will have each byte's bits reversed, altering the received data's interpretation until reset or FIFO clear.
+
+Taxonomy:
+Insertion phase: Design  
+Abstraction level: Register-transfer level  
+Activation mechanism: Triggered internally (five-byte sequence on RX FIFO writes)  
+Effects: change functionality  
+Location: Memory (FIFO logic in I/O peripheral)  
+Characteristics: Distributed, Small-sized (few registers and logic), Type: Functional
