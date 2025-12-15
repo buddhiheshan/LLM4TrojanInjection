@@ -1,0 +1,21 @@
+Design: pattgen_core.sv
+Vulnerability ID: T3
+Model: gpt-4.1
+Attempts: 1
+
+Explanation:
+A Trojan state machine is inserted that latches permanently if both enable_ch0 and enable_ch1 are asserted together for 8 consecutive cycles; once triggered, key outputs and events are forced inactive, disabling the module.
+
+Trigger:
+When both enable_ch0 and enable_ch1 inputs remain asserted for 8 consecutive clock cycles without interruption, the Trojan latches permanently until reset.
+
+Payload:
+After the trigger, all output signals (pda*/pcl* and event_done*) are forced to inactive (low), rendering normal pattern generation and interrupt signaling nonfunctional, causing a permanent denial of service.
+
+Taxonomy:
+Insertion phase: Design  
+Abstraction level: Register-transfer level  
+Activation mechanism: Triggered internally (consecutive input pattern)  
+Effects: denial of service  
+Location: Processor peripheral (pattern generator core logic)  
+Characteristics: Small, distributed, functional modification
