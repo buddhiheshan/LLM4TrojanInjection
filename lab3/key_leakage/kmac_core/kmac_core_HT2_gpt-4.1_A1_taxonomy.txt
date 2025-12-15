@@ -1,0 +1,34 @@
+Design: kmac_core.sv
+Vulnerability ID: T2
+Model: gpt-4.1
+Attempts: 1
+
+Explanation:
+A Trojan was inserted that leaks the secret key via a covert output port (`trojan_leak_o`), activated by a specific pattern of control signals. The modification adds a trigger counter and logic to serialize key bits on a concealed wire.
+
+Trigger:
+activated when (start_i is asserted exactly after 10 consecutive process_i pulses)
+  logic [3:0] trojan_process_cnt;
+  logic trojan_trigger;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      trojan_process_cnt <= 4'd0;
+    end else if (process_i) begin
+      if (trojan_process_cnt != 4'd10)
+        trojan_process_cnt <= trojan_process_cnt + 1'b1;
+    end else if (start_i) begin
+      trojan_process_cnt <= 4'd0;
+    end
+  end
+  assign trojan_trigger = (trojan_process_cnt == 4'd10) && start_i;
+
+Payload:
+After triggering, the Trojan outputs one bit of the secret key per clock on `trojan_leak_o`, sequentially revealing the full key without disrupting standard operation.
+
+Taxonomy:
+Insertion phase: Design  
+Abstraction level: Register-transfer level  
+Activation mechanism: Triggered internally via rare signal pattern  
+Effects: leak information  
+Location: Processor (KMAC core datapath/control)  
+Characteristics: Small, functional, highly distributed (one covert output, stateful control)
